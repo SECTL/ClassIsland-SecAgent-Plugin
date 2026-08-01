@@ -5,9 +5,16 @@
 
 id: classisland.secagent
 name: ClassIsland SecAgent
-description: 为 SecAgent 提供 ClassIsland 操作 Skill 和隐藏 MCP 服务。
+description: ClassIsland × SecAgent 联动插件，提供控制ClassIsland的MCP Server与Skill
 entranceAssembly: "ClassIsland.SecAgent.Plugin.dll"
 url: https://github.com/SECTL/ClassIsland-SecAgent-Plugin
 version: 0.1.0.0
 apiVersion: 2.0.0.0
 author: SECTL
+repoOwner: SECTL
+repoName: ClassIsland-SecAgent-Plugin
+assetsRoot: main/
+artifactName: ClassIsland.SecAgent.Plugin.cipx
+supportedOSPlatforms:
+  - Windows
+  - OSX
