@@ -1,0 +1,10 @@
+{
+  "name": "classisland-secagent-plugin-dev",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "dotnet build",
+    "start:classisland": "pnpm build && node scripts/start-classisland.mjs",
+    "dev": "pnpm start:classisland"
+  }
+}

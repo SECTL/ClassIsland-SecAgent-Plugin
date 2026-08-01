@@ -1,0 +1,10 @@
+.env
+
+bin/
+obj/
+node_modules/
+
+*.user
+*.suo
+*.pdb
+*.dll
