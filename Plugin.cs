@@ -1,4 +1,5 @@
 using System.Net;
+using System.Net.Http.Json;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
@@ -26,10 +27,12 @@ public sealed class Plugin : PluginBase
     {
         _server = new HttpApiServer();
         services.AddSingleton(_server);
-        services.AddSingleton<SecAgentController>();
+        var controller = new SecAgentController(_server);
+        services.AddSingleton(controller);
         services.AddSettingsPage<SecAgentSettingsPage>();
         try { _server.Start(); }
         catch { /* 端口冲突由设置页状态和 SecAgent 连接插件报告。 */ }
+        _ = controller.EnsureConnectorInstalledAsync();
         AppBase.Current.AppStopping += (_, _) => _server.Dispose();
     }
 }
@@ -37,14 +40,44 @@ public sealed class Plugin : PluginBase
 public sealed class SecAgentController
 {
     public const string ServerUrl = "http://127.0.0.1:18789";
+    public const string SecAgentServerUrl = "http://127.0.0.1:42189";
+    private const string ConnectorId = "classisland-connector";
+    private static readonly HttpClient Client = new() { Timeout = TimeSpan.FromSeconds(8) };
     private readonly HttpApiServer _server;
+    private int _installing;
+    private string _connectorStatus = "正在检查 SecAgent…";
 
     public SecAgentController(HttpApiServer server) => _server = server;
-    public SecAgentRegistrationStatus GetStatus() => new(ServerUrl, _server.IsRunning);
+    public SecAgentRegistrationStatus GetStatus() => new(ServerUrl, _server.IsRunning, _connectorStatus);
     public void Start() => _server.Start();
+
+    public async Task EnsureConnectorInstalledAsync()
+    {
+        if (Interlocked.Exchange(ref _installing, 1) == 1) return;
+        try
+        {
+            for (var attempt = 1; attempt <= 3; attempt++)
+            {
+                try
+                {
+                    using var response = await Client.PostAsJsonAsync(SecAgentServerUrl + "/plugins/install", new { pluginId = ConnectorId });
+                    var payload = await response.Content.ReadFromJsonAsync<JsonObject>() ?? new JsonObject();
+                    if (!response.IsSuccessStatusCode) throw new InvalidOperationException(payload["error"]?["message"]?.GetValue<string>() ?? ("HTTP " + (int)response.StatusCode));
+                    _connectorStatus = ("已自动安装 SecAgent 联动插件 " + (payload["version"]?.GetValue<string>() ?? "")).Trim();
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    _connectorStatus = attempt == 3 ? "等待 SecAgent：" + ex.Message : "正在等待 SecAgent…";
+                    if (attempt < 3) await Task.Delay(TimeSpan.FromSeconds(5));
+                }
+            }
+        }
+        finally { Volatile.Write(ref _installing, 0); }
+    }
 }
 
-public sealed record SecAgentRegistrationStatus(string ServerUrl, bool ServerRunning)
+public sealed record SecAgentRegistrationStatus(string ServerUrl, bool ServerRunning, string ConnectorStatus)
 {
     public bool ServiceAvailable => ServerRunning;
 }

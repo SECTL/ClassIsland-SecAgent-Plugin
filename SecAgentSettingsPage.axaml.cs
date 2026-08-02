@@ -4,7 +4,7 @@ using ClassIsland.Shared;
 
 namespace ClassIsland.SecAgent.Plugin;
 
-[SettingsPageInfo("classisland.secagent.settings", "SecAgent HTTP")]
+[SettingsPageInfo("classisland.secagent.settings", "SecAgent 联动插件")]
 public partial class SecAgentSettingsPage : SettingsPageBase
 {
     private SecAgentController Controller => IAppHost.GetService<SecAgentController>();
@@ -20,7 +20,8 @@ public partial class SecAgentSettingsPage : SettingsPageBase
         try
         {
             Controller.Start();
-            MessageText.Text = "HTTP 服务已启动。请同时启用 SecAgent ClassIsland 连接插件。";
+            MessageText.Text = "HTTP 服务已启动，SecAgent 联动插件会自动从插件市场安装。";
+            _ = Controller.EnsureConnectorInstalledAsync();
         }
         catch (Exception ex)
         {
@@ -35,6 +36,7 @@ public partial class SecAgentSettingsPage : SettingsPageBase
     private void RefreshStatus()
     {
         var status = Controller.GetStatus();
-        ServerStatusText.Text = status.ServerRunning ? "✓ 正在运行" : "✗ 未运行";
+        ServerStatusText.Text = status.ServerRunning ? $"✓ 正在运行（{status.ServerUrl}）" : "✗ 未运行";
+        ConnectorStatusText.Text = status.ConnectorStatus;
     }
 }

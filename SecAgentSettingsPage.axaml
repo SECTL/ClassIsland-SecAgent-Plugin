@@ -4,16 +4,18 @@
       xmlns:ci="http://classisland.tech/schemas/xaml/core">
     <ScrollViewer>
         <StackPanel Margin="32" Spacing="16" MaxWidth="900">
-            <TextBlock Text="SecAgent HTTP 服务" FontSize="28" FontWeight="Bold" />
-            <TextBlock Text="ClassIsland 提供普通 HTTP JSON API。对应的 SecAgent 连接插件会在服务可用时注册工具和 Skill。"
+            <TextBlock Text="SecAgent 联动插件" FontSize="28" FontWeight="Bold" />
+            <TextBlock Text="ClassIsland 提供普通 HTTP JSON API，并在 SecAgent 可用时自动请求安装 SecAgent 端联动插件。"
                        TextWrapping="Wrap" Opacity="0.72" />
             <Separator />
-            <TextBlock Text="服务状态" FontSize="18" FontWeight="SemiBold" />
-            <Grid ColumnDefinitions="Auto,*" RowDefinitions="Auto,Auto" RowSpacing="10" ColumnSpacing="16">
+            <TextBlock Text="联动状态" FontSize="18" FontWeight="SemiBold" />
+            <Grid ColumnDefinitions="Auto,*" RowDefinitions="Auto,Auto,Auto" RowSpacing="10" ColumnSpacing="16">
                 <TextBlock Grid.Row="0" Text="HTTP 服务" />
                 <TextBlock Grid.Row="0" Grid.Column="1" Name="ServerStatusText" />
                 <TextBlock Grid.Row="1" Text="服务地址" />
                 <TextBlock Grid.Row="1" Grid.Column="1" Text="http://127.0.0.1:18789" TextWrapping="Wrap" />
+                <TextBlock Grid.Row="2" Text="SecAgent 端" />
+                <TextBlock Grid.Row="2" Grid.Column="1" Name="ConnectorStatusText" TextWrapping="Wrap" />
             </Grid>
             <Button Name="StartButton" Content="启动 / 重启服务" HorizontalAlignment="Left" Click="StartButton_OnClick" />
             <TextBlock Name="MessageText" TextWrapping="Wrap" Opacity="0.72" />
