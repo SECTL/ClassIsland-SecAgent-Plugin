@@ -4,31 +4,18 @@
       xmlns:ci="http://classisland.tech/schemas/xaml/core">
     <ScrollViewer>
         <StackPanel Margin="32" Spacing="16" MaxWidth="900">
-            <TextBlock Text="SecAgent" FontSize="28" FontWeight="Bold" />
-            <TextBlock Text="查看 Skill、MCP 注册状态，并在需要时手动注册或修复。"
+            <TextBlock Text="SecAgent HTTP 服务" FontSize="28" FontWeight="Bold" />
+            <TextBlock Text="ClassIsland 提供普通 HTTP JSON API。对应的 SecAgent 连接插件会在服务可用时注册工具和 Skill。"
                        TextWrapping="Wrap" Opacity="0.72" />
-
             <Separator />
-
-            <TextBlock Text="工作目录" FontSize="18" FontWeight="SemiBold" />
-            <TextBlock Name="WorkspaceText" TextWrapping="Wrap" />
-
-            <TextBlock Text="注册状态" FontSize="18" FontWeight="SemiBold" Margin="0,12,0,0" />
-            <Grid ColumnDefinitions="Auto,*" RowDefinitions="Auto,Auto,Auto,Auto" RowSpacing="10" ColumnSpacing="16">
-                <TextBlock Grid.Row="0" Text="Skill" />
-                <TextBlock Grid.Row="0" Grid.Column="1" Name="SkillStatusText" />
-                <TextBlock Grid.Row="1" Text="MCP 配置" />
-                <TextBlock Grid.Row="1" Grid.Column="1" Name="McpStatusText" />
-                <TextBlock Grid.Row="2" Text="MCP 服务" />
-                <TextBlock Grid.Row="2" Grid.Column="1" Name="ServerStatusText" />
-                <TextBlock Grid.Row="3" Text="服务地址" />
-                <TextBlock Grid.Row="3" Grid.Column="1" Text="http://127.0.0.1:18789/mcp" TextWrapping="Wrap" />
+            <TextBlock Text="服务状态" FontSize="18" FontWeight="SemiBold" />
+            <Grid ColumnDefinitions="Auto,*" RowDefinitions="Auto,Auto" RowSpacing="10" ColumnSpacing="16">
+                <TextBlock Grid.Row="0" Text="HTTP 服务" />
+                <TextBlock Grid.Row="0" Grid.Column="1" Name="ServerStatusText" />
+                <TextBlock Grid.Row="1" Text="服务地址" />
+                <TextBlock Grid.Row="1" Grid.Column="1" Text="http://127.0.0.1:18789" TextWrapping="Wrap" />
             </Grid>
-
-            <Button Name="RegisterButton"
-                    Content="注册 / 修复 SecAgent"
-                    HorizontalAlignment="Left"
-                    Click="RegisterButton_OnClick" />
+            <Button Name="StartButton" Content="启动 / 重启服务" HorizontalAlignment="Left" Click="StartButton_OnClick" />
             <TextBlock Name="MessageText" TextWrapping="Wrap" Opacity="0.72" />
         </StackPanel>
     </ScrollViewer>

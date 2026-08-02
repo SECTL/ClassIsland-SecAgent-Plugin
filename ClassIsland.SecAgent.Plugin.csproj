@@ -11,7 +11,6 @@
     </PropertyGroup>
 
     <ItemGroup>
-        <PackageReference Include="YamlDotNet" Version="16.3.0" />
         <PackageReference Include="ClassIsland.PluginSdk" Version="$(ClassIslandPluginSdkVersion)">
             <ExcludeAssets>runtime; native</ExcludeAssets>
         </PackageReference>
@@ -25,12 +24,6 @@
             <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
         </None>
         <None Update="icon.png">
-            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-        </None>
-        <None Update="skills/classisland/SKILL.md">
-            <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
-        </None>
-        <None Update="skills/classisland/SETTINGS_REFERENCE.md">
             <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
         </None>
     </ItemGroup>

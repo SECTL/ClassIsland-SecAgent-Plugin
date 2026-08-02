@@ -9,332 +9,49 @@ using ClassIsland.Core.Abstractions.Services;
 using ClassIsland.Core.Attributes;
 using ClassIsland.Core.Controls;
 using ClassIsland.Core.Extensions.Registry;
+using ClassIsland.Core.Models.Components;
 using ClassIsland.Shared;
 using FluentAvalonia.UI.Controls;
 using Microsoft.Extensions.DependencyInjection;
 using Microsoft.Extensions.Hosting;
-using YamlDotNet.Core;
-using YamlDotNet.RepresentationModel;
 
 namespace ClassIsland.SecAgent.Plugin;
 
 [PluginEntrance]
 public sealed class Plugin : PluginBase
 {
-    private SecAgentController? _controller;
+    private HttpApiServer? _server;
 
     public override void Initialize(HostBuilderContext context, IServiceCollection services)
     {
-        _controller = new SecAgentController();
-        services.AddSingleton(_controller);
+        _server = new HttpApiServer();
+        services.AddSingleton(_server);
+        services.AddSingleton<SecAgentController>();
         services.AddSettingsPage<SecAgentSettingsPage>();
-        AppBase.Current.AppStarted += (_, _) => _ = _controller.InitializeAsync();
-        AppBase.Current.AppStopping += (_, _) => _controller.Dispose();
+        try { _server.Start(); }
+        catch { /* 端口冲突由设置页状态和 SecAgent 连接插件报告。 */ }
+        AppBase.Current.AppStopping += (_, _) => _server.Dispose();
     }
 }
 
-public sealed class SecAgentController : IDisposable
+public sealed class SecAgentController
 {
-    public const string ServerName = "classisland";
-    public const string ServerUrl = "http://127.0.0.1:18789/mcp";
-    private SecAgentBridge? _bridge;
+    public const string ServerUrl = "http://127.0.0.1:18789";
+    private readonly HttpApiServer _server;
 
-    public SecAgentRegistrationStatus GetStatus()
-    {
-        var workspace = SecAgentWorkspace.TryFind();
-        if (workspace is null) return new(null, false, false, false);
-        return new(workspace.Root, File.Exists(workspace.SkillFilePath), workspace.ConfigHasEnabledServer, _bridge?.IsRunning == true);
-    }
-
-    public async Task InitializeAsync()
-    {
-        try
-        {
-            var workspace = SecAgentWorkspace.TryFind();
-            if (workspace is null)
-            {
-                await CommonTaskDialogs.ShowDialog(
-                    "SecAgent 未找到工作目录",
-                    "未找到 ~/SecAgentWorkspace/secagent.yaml，因此不会修改任何文件。\n\n" +
-                    "如需注册，请先初始化 SecAgent，或设置 SECAGENT_WORKSPACE 环境变量。");
-                return;
-            }
-
-            if (!workspace.NeedsRegistration)
-            {
-                StartBridge();
-                return;
-            }
-
-            var result = await new TaskDialog
-            {
-                Title = "连接 SecAgent",
-                Content = $"ClassIsland-SecAgent 插件希望向以下 SecAgent 工作目录注册一个 Skill 和 MCP 服务：\n\n" +
-                          $"{workspace.Root}\n\n" +
-                          "注册内容：\n" +
-                          "• Skill：ClassIsland 操作、档案与主配置工具说明\n" +
-                          $"• MCP：{ServerName}（{ServerUrl}，仅本机可访问）\n\n" +
-                          "是否同意写入配置并启用该服务？",
-                XamlRoot = AppBase.Current.GetRootWindow(),
-                Buttons =
-                {
-                    new TaskDialogButton("取消", false),
-                    new TaskDialogButton("同意并注册", true) { IsDefault = true }
-                }
-            }.ShowAsync();
-            if (Equals(result, true)) await RegisterAsync();
-        }
-        catch (Exception ex)
-        {
-            await CommonTaskDialogs.ShowDialog("SecAgent 注册失败", ex.Message);
-        }
-    }
-
-    public async Task RegisterAsync()
-    {
-        var workspace = SecAgentWorkspace.TryFind();
-        if (workspace is null) throw new InvalidOperationException("未找到 SecAgent 工作目录：~/SecAgentWorkspace/secagent.yaml");
-        workspace.Register();
-        StartBridge();
-        await Task.CompletedTask;
-    }
-
-    private void StartBridge()
-    {
-        _bridge ??= new SecAgentBridge();
-        _bridge.Start();
-    }
-
-    public void Dispose() => _bridge?.Dispose();
+    public SecAgentController(HttpApiServer server) => _server = server;
+    public SecAgentRegistrationStatus GetStatus() => new(ServerUrl, _server.IsRunning);
+    public void Start() => _server.Start();
 }
 
-public sealed record SecAgentRegistrationStatus(string? Workspace, bool SkillRegistered, bool McpRegistered, bool ServerRunning)
+public sealed record SecAgentRegistrationStatus(string ServerUrl, bool ServerRunning)
 {
-    public bool WorkspaceFound => Workspace is not null;
+    public bool ServiceAvailable => ServerRunning;
 }
 
-internal sealed class SecAgentWorkspace
+public sealed class HttpApiServer : IDisposable
 {
-    private const string SkillDirectoryName = "classisland";
-    private const string McpFileName = "classisland-server.json";
-    private readonly string _configPath;
-
-    private SecAgentWorkspace(string root)
-    {
-        Root = root;
-        _configPath = Path.Combine(root, "secagent.yaml");
-    }
-
-    public string Root { get; }
-    public string SkillFilePath => Path.Combine(Root, "skills", SkillDirectoryName, "SKILL.md");
-    private string SettingsReferencePath => Path.Combine(Root, "skills", SkillDirectoryName, "SETTINGS_REFERENCE.md");
-    private string McpPath => Path.Combine(Root, "mcp", McpFileName);
-    public bool ConfigHasEnabledServer => HasEnabledServer();
-    public bool NeedsRegistration => !File.Exists(SkillFilePath) || !File.Exists(SettingsReferencePath) || !File.Exists(McpPath) || !ConfigHasEnabledServer || !SkillFilesAreCurrent();
-
-    public static SecAgentWorkspace? TryFind()
-    {
-        var configured = Environment.GetEnvironmentVariable("SECAGENT_WORKSPACE");
-        var root = string.IsNullOrWhiteSpace(configured)
-            ? Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile), "SecAgentWorkspace")
-            : Path.GetFullPath(configured);
-        return File.Exists(Path.Combine(root, "secagent.yaml")) ? new SecAgentWorkspace(root) : null;
-    }
-
-    public void Register()
-    {
-        Directory.CreateDirectory(Path.GetDirectoryName(SkillFilePath)!);
-        Directory.CreateDirectory(Path.GetDirectoryName(McpPath)!);
-        File.WriteAllText(SkillFilePath, LoadSkillContent(), new UTF8Encoding(false));
-        File.WriteAllText(SettingsReferencePath, LoadSkillReference(), new UTF8Encoding(false));
-        File.WriteAllText(McpPath, McpJson, new UTF8Encoding(false));
-        UpdateConfig();
-    }
-
-    private bool SkillFilesAreCurrent()
-    {
-        try
-        {
-            return string.Equals(File.ReadAllText(SkillFilePath, Encoding.UTF8), LoadSkillContent(), StringComparison.Ordinal) &&
-                   string.Equals(File.ReadAllText(SettingsReferencePath, Encoding.UTF8), LoadSkillReference(), StringComparison.Ordinal);
-        }
-        catch (IOException) { return false; }
-    }
-
-    private static string LoadSkillContent()
-    {
-        var assemblyDirectory = Path.GetDirectoryName(typeof(Plugin).Assembly.Location);
-        var candidates = new[]
-        {
-            assemblyDirectory is null ? null : Path.Combine(assemblyDirectory, "skills", "classisland", "SKILL.md"),
-            Path.Combine(AppContext.BaseDirectory, "skills", "classisland", "SKILL.md")
-        }.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.Ordinal).ToArray();
-        var path = candidates.FirstOrDefault(File.Exists);
-        if (path is null) throw new FileNotFoundException("插件内置 Skill 文件不存在。请确保发布插件时保留 skills/classisland/SKILL.md。", string.Join("; ", candidates));
-        var content = File.ReadAllText(path, Encoding.UTF8);
-        if (!content.StartsWith("---\nname: classisland\ndescription: 执行ClassIsland操作，如换课、修改课表、修改CI设置（ClassIsland简称CI）\n---", StringComparison.Ordinal))
-            throw new InvalidDataException("插件内置 SKILL.md 的 frontmatter 不符合约定。\n" + path);
-        return content;
-    }
-
-    private static string LoadSkillReference()
-    {
-        var assemblyDirectory = Path.GetDirectoryName(typeof(Plugin).Assembly.Location);
-        var candidates = new[]
-        {
-            assemblyDirectory is null ? null : Path.Combine(assemblyDirectory, "skills", "classisland", "SETTINGS_REFERENCE.md"),
-            Path.Combine(AppContext.BaseDirectory, "skills", "classisland", "SETTINGS_REFERENCE.md")
-        }.Where(x => !string.IsNullOrWhiteSpace(x)).Distinct(StringComparer.Ordinal).ToArray();
-        var path = candidates.FirstOrDefault(File.Exists);
-        if (path is null) throw new FileNotFoundException("插件内置 ClassIsland 设置参考文件不存在。", string.Join("; ", candidates));
-        return File.ReadAllText(path, Encoding.UTF8);
-    }
-
-    private bool HasEnabledServer()
-    {
-        try
-        {
-            var root = LoadRoot(File.ReadAllText(_configPath));
-            var servers = FindMapping(root, "mcp", "servers");
-            var classIsland = FindMapping(servers, "classisland");
-            return Scalar(classIsland, "url") == SecAgentBridge.ServerUrl &&
-                   string.Equals(Scalar(classIsland, "enabled"), "true", StringComparison.OrdinalIgnoreCase);
-        }
-        catch (YamlException)
-        {
-            return false;
-        }
-    }
-
-    private void UpdateConfig()
-    {
-        var yaml = new YamlStream();
-        using (var reader = new StringReader(File.ReadAllText(_configPath))) yaml.Load(reader);
-        if (yaml.Documents.Count != 1 || yaml.Documents[0].RootNode is not YamlMappingNode root)
-            throw new InvalidDataException("SecAgent 配置必须是一个 YAML 对象。");
-
-        var mcp = GetOrCreateMapping(root, "mcp");
-        var servers = GetOrCreateMapping(mcp, "servers");
-        var classIsland = GetOrCreateMapping(servers, "classisland");
-        SetScalar(classIsland, "transport", "http");
-        SetScalar(classIsland, "url", SecAgentBridge.ServerUrl);
-        SetScalar(classIsland, "enabled", "true");
-
-        var serialized = Serialize(yaml);
-        _ = LoadRoot(serialized); // 重新解析序列化结果，确认写入内容仍是合法 YAML。
-
-        var backupPath = _configPath + ".bak";
-        File.Copy(_configPath, backupPath, true);
-        var tempPath = _configPath + ".tmp." + Guid.NewGuid().ToString("N");
-        try
-        {
-            File.WriteAllText(tempPath, serialized, new UTF8Encoding(false));
-            File.Move(tempPath, _configPath, true);
-        }
-        finally
-        {
-            if (File.Exists(tempPath)) File.Delete(tempPath);
-        }
-    }
-
-    private static YamlMappingNode LoadRoot(string content)
-    {
-        var yaml = new YamlStream();
-        using var reader = new StringReader(content);
-        yaml.Load(reader);
-        if (yaml.Documents.Count != 1 || yaml.Documents[0].RootNode is not YamlMappingNode root)
-            throw new YamlException("SecAgent 配置必须是一个 YAML 对象。");
-        return root;
-    }
-
-    private static YamlMappingNode FindMapping(YamlMappingNode parent, params string[] path)
-    {
-        var current = parent;
-        foreach (var key in path)
-        {
-            if (!current.Children.TryGetValue(new YamlScalarNode(key), out var node) || node is not YamlMappingNode mapping)
-                throw new YamlException($"找不到 YAML 对象节点：{key}");
-            current = mapping;
-        }
-        return current;
-    }
-
-    private static YamlMappingNode GetOrCreateMapping(YamlMappingNode parent, string key)
-    {
-        var keyNode = new YamlScalarNode(key);
-        if (parent.Children.TryGetValue(keyNode, out var node))
-        {
-            if (node is YamlMappingNode mapping) return mapping;
-            throw new YamlException($"YAML 节点不是对象：{key}");
-        }
-        var created = new YamlMappingNode();
-        parent.Add(keyNode, created);
-        return created;
-    }
-
-    private static string? Scalar(YamlMappingNode parent, string key)
-    {
-        return parent.Children.TryGetValue(new YamlScalarNode(key), out var node) && node is YamlScalarNode scalar
-            ? scalar.Value
-            : null;
-    }
-
-    private static void SetScalar(YamlMappingNode parent, string key, string value)
-    {
-        parent.Children[new YamlScalarNode(key)] = new YamlScalarNode(value);
-    }
-
-    private static string Serialize(YamlStream yaml)
-    {
-        using var writer = new StringWriter(System.Globalization.CultureInfo.InvariantCulture);
-        yaml.Save(writer, false);
-        return writer.ToString();
-    }
-
-    private const string McpJson = """
-{
-  "name": "classisland",
-  "transport": "http",
-  "url": "http://127.0.0.1:18789/mcp",
-  "tools": [
-    {
-      "name": "get_classisland_version_status",
-      "hidden": true
-    },
-    {
-      "name": "list_classisland_profiles",
-      "hidden": true
-    },
-    {
-      "name": "read_classisland_profile",
-      "hidden": true
-    },
-    {
-      "name": "write_classisland_profile",
-      "hidden": true
-    },
-    {
-      "name": "read_classisland_main_config",
-      "hidden": true
-    },
-    {
-      "name": "update_classisland_main_config",
-      "hidden": true
-    }
-  ]
-}
-""";
-}
-
-internal sealed class SecAgentBridge : IDisposable
-{
-    public const string ServerUrl = "http://127.0.0.1:18789/mcp";
-    private const string VersionTool = "get_classisland_version_status";
-    private const string ListProfilesTool = "list_classisland_profiles";
-    private const string ReadProfileTool = "read_classisland_profile";
-    private const string WriteProfileTool = "write_classisland_profile";
-    private const string ReadMainConfigTool = "read_classisland_main_config";
-    private const string UpdateMainConfigTool = "update_classisland_main_config";
+    public const string ServerUrl = "http://127.0.0.1:18789";
     private readonly HttpListener _listener = new();
     private CancellationTokenSource? _cts;
     public bool IsRunning => _cts is not null;
@@ -342,12 +59,25 @@ internal sealed class SecAgentBridge : IDisposable
     public void Start()
     {
         if (_cts is not null) return;
-        _listener.Prefixes.Add("http://127.0.0.1:18789/");
+        _listener.Prefixes.Add(ServerUrl + "/");
         _listener.Start();
         _cts = new CancellationTokenSource();
         _ = ListenAsync(_cts.Token);
     }
 
+    private const string VersionTool = "get_classisland_version_status";
+    private const string ListProfilesTool = "list_classisland_profiles";
+    private const string ReadProfileTool = "read_classisland_profile";
+    private const string WriteProfileTool = "write_classisland_profile";
+    private const string CreateProfileFromTimetableTool = "create_classisland_profile_from_timetable";
+    private const string ReadMainConfigTool = "read_classisland_main_config";
+    private const string ListMainSettingsTool = "list_classisland_settings";
+    private const string UpdateMainConfigTool = "update_classisland_main_config";
+    private const string ListComponentConfigsTool = "list_classisland_component_configs";
+    private const string ListComponentsTool = "list_classisland_components";
+    private const string ReadComponentConfigTool = "read_classisland_component_config";
+    private const string WriteComponentConfigTool = "write_classisland_component_config";
+    private const string UpdateComponentTool = "update_classisland_component";
     private async Task ListenAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -366,38 +96,64 @@ internal sealed class SecAgentBridge : IDisposable
         context.Response.Headers["Access-Control-Allow-Origin"] = "*";
         try
         {
-            using var document = await JsonDocument.ParseAsync(context.Request.InputStream, cancellationToken: cancellationToken);
-            var root = document.RootElement;
-            var method = root.TryGetProperty("method", out var methodElement) ? methodElement.GetString() : null;
-            var id = root.TryGetProperty("id", out var idElement) ? JsonNode.Parse(idElement.GetRawText()) : null;
-            JsonNode response = method switch
+            var path = context.Request.Url?.AbsolutePath.TrimEnd('/') ?? "";
+            if (context.Request.HttpMethod == "OPTIONS")
             {
-                "tools/list" => ToolsList(id),
-                "tools/call" => ToolsCall(root, id),
-                "initialize" => Initialize(id),
-                _ => Error(id, -32601, $"不支持的方法：{method}")
-            };
-            var bytes = Encoding.UTF8.GetBytes(response.ToJsonString());
-            await context.Response.OutputStream.WriteAsync(bytes, cancellationToken);
+                context.Response.StatusCode = 204;
+                return;
+            }
+
+            if (context.Request.HttpMethod == "GET" && path == "/health")
+            {
+                await WriteJsonAsync(context, 200, new JsonObject { ["apiVersion"] = 1, ["name"] = "classisland", ["version"] = AppBase.AppVersion, ["status"] = "ok" }, cancellationToken);
+                return;
+            }
+
+            if (context.Request.HttpMethod == "GET" && path == "/tools")
+            {
+                await WriteJsonAsync(context, 200, new JsonObject { ["apiVersion"] = 1, ["tools"] = Tools() }, cancellationToken);
+                return;
+            }
+
+            if (context.Request.HttpMethod == "POST" && path.StartsWith("/tools/", StringComparison.Ordinal))
+            {
+                var name = Uri.UnescapeDataString(path["/tools/".Length..]);
+                using var document = await JsonDocument.ParseAsync(context.Request.InputStream, cancellationToken: cancellationToken);
+                var result = CallTool(name, document.RootElement);
+                await WriteJsonAsync(context, 200, new JsonObject { ["ok"] = true, ["result"] = result }, cancellationToken);
+                return;
+            }
+
+            await WriteJsonAsync(context, 404, new JsonObject { ["ok"] = false, ["error"] = "Not found" }, cancellationToken);
         }
         catch (Exception ex)
         {
-            var bytes = Encoding.UTF8.GetBytes(Error(null, -32603, ex.Message).ToJsonString());
-            await context.Response.OutputStream.WriteAsync(bytes, cancellationToken);
+            await WriteJsonAsync(context, 400, new JsonObject { ["ok"] = false, ["error"] = new JsonObject { ["message"] = ex.Message } }, cancellationToken);
         }
         finally { context.Response.Close(); }
     }
 
-    private static JsonNode ToolsList(JsonNode? id) => RpcResult(id, new JsonObject
+    private static async Task WriteJsonAsync(HttpListenerContext context, int statusCode, JsonNode body, CancellationToken cancellationToken)
     {
-        ["tools"] = new JsonArray(
-            Tool(VersionTool, "获取当前 ClassIsland 的版本和运行状态。", EmptySchema()),
-            Tool(ListProfilesTool, "列出 ClassIsland 档案。", EmptySchema()),
-            Tool(ReadProfileTool, "按路径读取 ClassIsland 档案片段。", ProfileReadSchema()),
-            Tool(WriteProfileTool, "对 ClassIsland 档案执行差量更新。", ProfileWriteSchema()),
-            Tool(ReadMainConfigTool, "读取 ClassIsland 主配置。", EmptySchema()),
-            Tool(UpdateMainConfigTool, "按属性更新 ClassIsland 主配置。", ObjectSchema(("patch", "object"))))
-    });
+        context.Response.StatusCode = statusCode;
+        var bytes = Encoding.UTF8.GetBytes(body.ToJsonString());
+        await context.Response.OutputStream.WriteAsync(bytes, cancellationToken);
+    }
+
+    private static JsonArray Tools() => new(
+        Tool(CreateProfileFromTimetableTool, "Create a new ClassIsland profile from semantic timetable rows; the server generates and links all GUIDs.", CreateProfileFromTimetableSchema()),
+        Tool(VersionTool, "获取当前 ClassIsland 的版本和运行状态。", EmptySchema()),
+        Tool(ListProfilesTool, "列出 ClassIsland 档案。", EmptySchema()),
+        Tool(ReadProfileTool, "按路径读取 ClassIsland 档案片段。", ProfileReadSchema()),
+        Tool(WriteProfileTool, "对 ClassIsland 档案执行差量更新。", ProfileWriteSchema()),
+        Tool(ReadMainConfigTool, "读取 ClassIsland 主配置。", EmptySchema()),
+        Tool(ListMainSettingsTool, "列出 ClassIsland 可持久化主设置的类型、当前值和枚举选项。", MainSettingsListSchema()),
+        Tool(UpdateMainConfigTool, "按属性更新 ClassIsland 主配置。", ObjectSchema(("patch", "object"))),
+        Tool(ListComponentConfigsTool, "列出 ClassIsland 主界面组件配置。", EmptySchema()),
+        Tool(ListComponentsTool, "列出 ClassIsland 主界面的组件、名称、类型和通用高级设置。", ComponentListSchema()),
+        Tool(ReadComponentConfigTool, "读取 ClassIsland 主界面组件配置。", ComponentConfigReadSchema()),
+        Tool(WriteComponentConfigTool, "修改 ClassIsland 主界面组件配置。", ComponentConfigWriteSchema()),
+        Tool(UpdateComponentTool, "按组件 ID 修改 ClassIsland 组件的通用高级设置或专属设置。", ComponentUpdateSchema()));
 
     private static JsonObject Tool(string name, string description, JsonObject schema) => new()
     {
@@ -439,26 +195,129 @@ internal sealed class SecAgentBridge : IDisposable
         ["required"] = new JsonArray("profile_name"), ["additionalProperties"] = false
     };
 
-    private static JsonNode ToolsCall(JsonElement root, JsonNode? id)
+    private static JsonObject CreateProfileFromTimetableSchema() => new()
     {
-        var parameters = root.TryGetProperty("params", out var p) ? p : default;
-        var name = parameters.ValueKind == JsonValueKind.Object && parameters.TryGetProperty("name", out var n) ? n.GetString() : null;
-        var arguments = parameters.ValueKind == JsonValueKind.Object && parameters.TryGetProperty("arguments", out var a) ? a : default;
-        try
+        ["type"] = "object",
+        ["properties"] = new JsonObject
         {
-            var result = name switch
+            ["profile_name"] = new JsonObject { ["type"] = "string", ["description"] = "新档案文件名，必须是当前目录下的 .json 文件名。" },
+            ["display_name"] = new JsonObject { ["type"] = "string", ["description"] = "档案显示名称；省略时使用文件名。" },
+            ["overwrite"] = new JsonObject { ["type"] = "boolean", ["description"] = "目标文件已存在时是否覆盖；默认 false。" },
+            ["days"] = new JsonObject
             {
-                VersionTool => VersionStatus(),
-                ListProfilesTool => ListProfiles(),
-                ReadProfileTool => ReadProfile(arguments),
-                WriteProfileTool => WriteProfile(arguments),
-                ReadMainConfigTool => ReadMainConfig(),
-                UpdateMainConfigTool => UpdateMainConfig(arguments),
-                _ => throw new ArgumentException($"未知工具：{name}")
-            };
-            return RpcResult(id, new JsonObject { ["structuredContent"] = result, ["content"] = new JsonArray(new JsonObject { ["type"] = "text", ["text"] = result.ToJsonString() }) });
-        }
-        catch (Exception ex) { return Error(id, -32602, ex.Message); }
+                ["type"] = "array",
+                ["description"] = "weekday 使用 CI 的 DayOfWeek 数字：周日 0、周一 1、...、周六 6。",
+                ["items"] = new JsonObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JsonObject
+                    {
+                        ["weekday"] = new JsonObject { ["type"] = "integer", ["minimum"] = 0, ["maximum"] = 6 },
+                        ["name"] = new JsonObject { ["type"] = "string" },
+                        ["rows"] = new JsonObject
+                        {
+                            ["type"] = "array",
+                            ["items"] = new JsonObject
+                            {
+                                ["type"] = "object",
+                                ["properties"] = new JsonObject
+                                {
+                                    ["start"] = new JsonObject { ["type"] = "string", ["description"] = "例如 07:30 或 07:30:00。" },
+                                    ["end"] = new JsonObject { ["type"] = "string", ["description"] = "例如 07:50 或 07:50:00。" },
+                                    ["subject"] = new JsonObject { ["type"] = "string", ["description"] = "上课时填写科目名称；留空表示课间/活动。" },
+                                    ["label"] = new JsonObject { ["type"] = "string", ["description"] = "课间或活动显示名称；上课时可省略。" },
+                                    ["type"] = new JsonObject { ["type"] = "string", ["description"] = "可选：lesson/class、break/rest/activity、line。省略时按 subject 是否为空推断。" }
+                                },
+                                ["required"] = new JsonArray("start", "end"),
+                                ["additionalProperties"] = false
+                            }
+                        }
+                    },
+                    ["required"] = new JsonArray("weekday", "rows"),
+                    ["additionalProperties"] = false
+                }
+            }
+        },
+        ["required"] = new JsonArray("profile_name", "days"),
+        ["additionalProperties"] = false
+    };
+
+    private static JsonObject ComponentConfigReadSchema() => new()
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["config_name"] = new JsonObject { ["type"] = "string", ["description"] = "组件配置名，例如 Default.json" },
+            ["path"] = new JsonObject { ["type"] = "string", ["description"] = "点号分隔路径；空字符串返回完整配置。" }
+        },
+        ["required"] = new JsonArray("config_name", "path"), ["additionalProperties"] = false
+    };
+
+    private static JsonObject ComponentConfigWriteSchema() => new()
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["config_name"] = new JsonObject { ["type"] = "string", ["description"] = "组件配置名，例如 Default.json" },
+            ["patch"] = new JsonObject { ["type"] = "object", ["description"] = "根对象的递归增量更新" },
+            ["path"] = new JsonObject { ["type"] = "string", ["description"] = "要更新的点号路径" },
+            ["value"] = new JsonObject { ["description"] = "path 对应的新值，可以是任意 JSON 值" }
+        },
+        ["required"] = new JsonArray("config_name"), ["additionalProperties"] = false
+    };
+
+    private static JsonObject ComponentListSchema() => new()
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["config_name"] = new JsonObject { ["type"] = "string", ["description"] = "可选；默认使用当前激活的组件配置" }
+        },
+        ["additionalProperties"] = false
+    };
+
+    private static JsonObject ComponentUpdateSchema() => new()
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["config_name"] = new JsonObject { ["type"] = "string", ["description"] = "可选；默认使用当前激活的组件配置" },
+            ["component_id"] = new JsonObject { ["type"] = "string", ["description"] = "组件的 UUID" },
+            ["common_patch"] = new JsonObject { ["type"] = "object", ["description"] = "通用高级设置，例如 HideOnRule、Opacity、MarginLeft、IsFixedWidthEnabled 等" },
+            ["settings_patch"] = new JsonObject { ["type"] = "object", ["description"] = "组件专属设置，例如课表组件的 CountdownSeconds 等" }
+        },
+        ["required"] = new JsonArray("component_id"), ["additionalProperties"] = false
+    };
+
+    private static JsonObject MainSettingsListSchema() => new()
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["include_values"] = new JsonObject { ["type"] = "boolean", ["description"] = "是否返回每个设置的当前值，默认 true。" }
+        },
+        ["additionalProperties"] = false
+    };
+
+    private static JsonNode CallTool(string name, JsonElement arguments)
+    {
+        return name switch
+        {
+            VersionTool => VersionStatus(),
+            ListProfilesTool => ListProfiles(),
+            ReadProfileTool => ReadProfile(arguments),
+            WriteProfileTool => WriteProfile(arguments),
+            CreateProfileFromTimetableTool => CreateProfileFromTimetable(arguments),
+            ReadMainConfigTool => ReadMainConfig(),
+            ListMainSettingsTool => ListMainSettings(arguments),
+            UpdateMainConfigTool => UpdateMainConfig(arguments),
+            ListComponentConfigsTool => ListComponentConfigs(),
+            ListComponentsTool => ListComponents(),
+            ReadComponentConfigTool => ReadComponentConfig(arguments),
+            WriteComponentConfigTool => WriteComponentConfig(arguments),
+            UpdateComponentTool => UpdateComponent(arguments),
+            _ => throw new ArgumentException($"未知工具：{name}")
+        };
     }
 
     private static JsonObject VersionStatus() => new()
@@ -466,6 +325,7 @@ internal sealed class SecAgentBridge : IDisposable
         ["appVersion"] = AppBase.AppVersion, ["appVersionLong"] = AppBase.AppVersionLong,
         ["buildType"] = AppBase.Current.BuildType, ["appSubChannel"] = AppBase.Current.AppSubChannel,
         ["platform"] = AppBase.Current.Platform, ["operatingSystem"] = AppBase.Current.OperatingSystem,
+        ["localDateTime"] = DateTime.Now.ToString("O"), ["localDate"] = DateTime.Now.ToString("yyyy-MM-dd"),
         ["isDevelopmentBuild"] = AppBase.Current.IsDevelopmentBuild
     };
 
@@ -501,8 +361,305 @@ internal sealed class SecAgentBridge : IDisposable
         var node = JsonNode.Parse(File.ReadAllText(path)) ?? throw new InvalidDataException("档案不是有效 JSON。");
         if (!string.IsNullOrWhiteSpace(pathExpression)) SetPath(node, pathExpression!, JsonNode.Parse(valueElement.GetRawText()));
         else MergeObject(node, JsonNode.Parse(patchElement.GetRawText())!.AsObject());
+        ValidateProfileCandidate(node);
+        ValidateProfileReferences(node);
         WriteJsonAtomically(path, node);
-        return new JsonObject { ["profile_name"] = name, ["written"] = true, ["backup"] = path + ".bak" };
+        var runtimeReloaded = TryReloadCurrentProfile(name, out var runtimeReloadError);
+        var result = new JsonObject
+        {
+            ["profile_name"] = name,
+            ["written"] = true,
+            ["backup"] = path + ".bak",
+            ["runtime_reloaded"] = runtimeReloaded
+        };
+        if (runtimeReloadError is not null) result["runtime_reload_error"] = runtimeReloadError;
+        return result;
+    }
+
+    private static JsonObject CreateProfileFromTimetable(JsonElement arguments)
+    {
+        var name = SafeFileName(arguments, "profile_name");
+        var displayName = arguments.TryGetProperty("display_name", out var displayElement) && displayElement.ValueKind == JsonValueKind.String
+            ? displayElement.GetString()?.Trim()
+            : null;
+        displayName = string.IsNullOrWhiteSpace(displayName) ? Path.GetFileNameWithoutExtension(name) : displayName;
+        var overwrite = arguments.TryGetProperty("overwrite", out var overwriteElement) && overwriteElement.ValueKind == JsonValueKind.True;
+        if (!arguments.TryGetProperty("days", out var daysElement) || daysElement.ValueKind != JsonValueKind.Array || daysElement.GetArrayLength() == 0)
+            throw new ArgumentException("days 必须是至少包含一天的数组。");
+
+        var profilesPath = Path.Combine(CommonDirectories.AppRootFolderPath, "Profiles");
+        var targetPath = Path.Combine(profilesPath, name);
+        if (File.Exists(targetPath) && !overwrite) throw new IOException($"档案已存在：{name}；如需覆盖请明确传入 overwrite:true。");
+
+        var days = new List<TimetableDay>();
+        var weekdays = new HashSet<int>();
+        foreach (var dayElement in daysElement.EnumerateArray())
+        {
+            if (dayElement.ValueKind != JsonValueKind.Object) throw new ArgumentException("days 中的每一项必须是对象。");
+            if (!dayElement.TryGetProperty("weekday", out var weekdayElement) || !weekdayElement.TryGetInt32(out var weekday) || weekday is < 0 or > 6)
+                throw new ArgumentException("weekday 必须是 0 到 6 的整数：周日 0、周一 1、...、周六 6。");
+            if (!weekdays.Add(weekday)) throw new ArgumentException($"weekday {weekday} 重复；每个星期只能有一个课表。");
+            if (!dayElement.TryGetProperty("rows", out var rowsElement) || rowsElement.ValueKind != JsonValueKind.Array || rowsElement.GetArrayLength() == 0)
+                throw new ArgumentException($"weekday {weekday} 的 rows 不能为空。");
+
+            var dayName = dayElement.TryGetProperty("name", out var dayNameElement) && dayNameElement.ValueKind == JsonValueKind.String
+                ? dayNameElement.GetString()?.Trim()
+                : null;
+            dayName = string.IsNullOrWhiteSpace(dayName) ? WeekdayName(weekday) : dayName;
+            var rows = new List<TimetableRow>();
+            foreach (var rowElement in rowsElement.EnumerateArray())
+            {
+                if (rowElement.ValueKind != JsonValueKind.Object) throw new ArgumentException($"weekday {weekday} 的 rows 中存在非对象项。");
+                var start = ParseTime(rowElement, "start");
+                var end = ParseTime(rowElement, "end");
+                if (end <= start) throw new ArgumentException($"weekday {weekday} 存在结束时间不晚于开始时间的行：{start:hh\\:mm\\:ss}-{end:hh\\:mm\\:ss}。");
+                var subject = OptionalString(rowElement, "subject");
+                var label = OptionalString(rowElement, "label");
+                var kind = OptionalString(rowElement, "type").ToLowerInvariant();
+                var timeType = kind switch
+                {
+                    "line" or "separator" or "分割线" => 2,
+                    "lesson" or "class" or "上课" => 0,
+                    "break" or "rest" or "activity" or "课间" or "休息" or "活动" => 1,
+                    "" => string.IsNullOrWhiteSpace(subject) ? 1 : 0,
+                    _ => throw new ArgumentException($"不支持的 timetable row type：{kind}；请使用 lesson、break 或 line。")
+                };
+                if (timeType == 0 && string.IsNullOrWhiteSpace(subject)) throw new ArgumentException($"weekday {weekday} 有上课行缺少 subject。");
+                if (timeType == 1 && string.IsNullOrWhiteSpace(label)) label = "课间";
+                rows.Add(new TimetableRow(start, end, timeType, subject, label));
+            }
+            days.Add(new TimetableDay(weekday, dayName!, rows));
+        }
+
+        var templatePath = IAppHost.Host?.Services.GetService<IProfileService>()?.CurrentProfilePath;
+        if (string.IsNullOrWhiteSpace(templatePath) || !File.Exists(templatePath)) templatePath = Path.Combine(profilesPath, "Default.json");
+        var root = File.Exists(templatePath)
+            ? JsonNode.Parse(File.ReadAllText(templatePath)) as JsonObject ?? throw new InvalidDataException("当前 CI 档案不是有效 JSON 对象。")
+            : new JsonObject();
+
+        var defaultGroupId = "acaf4ef0-e261-4262-b941-34ea93cb4369";
+        var globalGroupId = "00000000-0000-0000-0000-000000000000";
+        var groups = root["ClassPlanGroups"] as JsonObject ?? new JsonObject();
+        root["ClassPlanGroups"] = groups;
+        groups[defaultGroupId] ??= new JsonObject { ["Name"] = "默认", ["IsGlobal"] = false };
+        groups[globalGroupId] ??= new JsonObject { ["Name"] = "全局课表群", ["IsGlobal"] = true };
+        var subjects = root["Subjects"] as JsonObject ?? new JsonObject();
+        root["Subjects"] = subjects;
+
+        var layouts = new JsonObject();
+        var plans = new JsonObject();
+        var layoutBySignature = new Dictionary<string, (string Id, string Name)>();
+        var createdLayoutInfo = new JsonArray();
+        var createdPlanInfo = new JsonArray();
+        var createdSubjectInfo = new JsonArray();
+        foreach (var day in days.OrderBy(x => x.Weekday))
+        {
+            var signature = string.Join("|", day.Rows.Select(x => $"{x.Start:c};{x.End:c};{x.TimeType}"));
+            if (!layoutBySignature.TryGetValue(signature, out var layoutInfo))
+            {
+                layoutInfo = (Guid.NewGuid().ToString(), $"{day.Name}时间表");
+                layoutBySignature[signature] = layoutInfo;
+                var layoutItems = new JsonArray();
+                foreach (var row in day.Rows)
+                {
+                    var item = new JsonObject
+                    {
+                        ["StartTime"] = row.Start.ToString(@"hh\:mm\:ss"),
+                        ["EndTime"] = row.End.ToString(@"hh\:mm\:ss"),
+                        ["TimeType"] = row.TimeType
+                    };
+                    if (row.TimeType == 0) item["DefaultClassId"] = Guid.Empty.ToString();
+                    if (row.TimeType == 1) item["BreakName"] = row.Label;
+                    layoutItems.Add(item);
+                }
+                layouts[layoutInfo.Id] = new JsonObject { ["Name"] = layoutInfo.Name, ["Layouts"] = layoutItems };
+                createdLayoutInfo.Add(new JsonObject { ["id"] = layoutInfo.Id, ["name"] = layoutInfo.Name, ["weekday"] = day.Weekday });
+            }
+
+            var classes = new JsonArray();
+            foreach (var row in day.Rows.Where(x => x.TimeType == 0))
+            {
+                var subjectId = FindOrCreateSubject(subjects, row.Subject, createdSubjectInfo);
+                classes.Add(new JsonObject { ["SubjectId"] = subjectId });
+            }
+            var planId = Guid.NewGuid().ToString();
+            plans[planId] = new JsonObject
+            {
+                ["Name"] = $"{day.Name}课表",
+                ["TimeLayoutId"] = layoutInfo.Id,
+                ["AssociatedGroup"] = defaultGroupId,
+                ["IsEnabled"] = true,
+                ["TimeRule"] = new JsonObject { ["WeekDay"] = day.Weekday, ["WeekCountDiv"] = 0, ["WeekCountDivTotal"] = 2 },
+                ["Classes"] = classes
+            };
+            createdPlanInfo.Add(new JsonObject { ["id"] = planId, ["name"] = $"{day.Name}课表", ["weekday"] = day.Weekday, ["time_layout_id"] = layoutInfo.Id, ["class_count"] = classes.Count });
+        }
+
+        root["Name"] = displayName;
+        root["TimeLayouts"] = layouts;
+        root["ClassPlans"] = plans;
+        root["OrderedSchedules"] = new JsonObject();
+        root["Id"] = Guid.NewGuid().ToString();
+        root["SelectedClassPlanGroupId"] = defaultGroupId;
+        root["IsOverlayClassPlanEnabled"] = false;
+        root["OverlayClassPlanId"] = null;
+        root["TempClassPlanId"] = null;
+        root["IsTempClassPlanGroupEnabled"] = false;
+        root["TempClassPlanGroupId"] = null;
+        root["IsActive"] = false;
+        ValidateProfileCandidate(root);
+        ValidateProfileReferences(root);
+        WriteJsonAtomically(targetPath, root);
+        var runtimeReloaded = TryReloadCurrentProfile(name, out var runtimeReloadError);
+
+        var result = new JsonObject
+        {
+            ["profile_name"] = name,
+            ["display_name"] = displayName,
+            ["written"] = true,
+            ["overwritten"] = overwrite,
+            ["runtime_reloaded"] = runtimeReloaded,
+            ["activated"] = runtimeReloaded,
+            ["time_layouts"] = createdLayoutInfo,
+            ["class_plans"] = createdPlanInfo,
+            ["subjects_created"] = createdSubjectInfo,
+            ["next_step"] = runtimeReloaded ? "档案已重新加载。" : "档案已创建，但不是当前运行档案；请在 CI 的档案选择器中切换或重启 CI 后选择它。"
+        };
+        if (runtimeReloadError is not null) result["runtime_reload_error"] = runtimeReloadError;
+        return result;
+    }
+
+    private static string OptionalString(JsonElement element, string property)
+        => element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String ? value.GetString()?.Trim() ?? "" : "";
+
+    private static TimeSpan ParseTime(JsonElement element, string property)
+    {
+        var text = OptionalString(element, property);
+        if (!TimeSpan.TryParse(text, out var value) || value < TimeSpan.Zero || value >= TimeSpan.FromDays(1))
+            throw new ArgumentException($"{property} 必须是有效的当天时间，例如 07:30 或 07:30:00：{text}");
+        return value;
+    }
+
+    private static string WeekdayName(int weekday) => weekday switch
+    {
+        0 => "周日", 1 => "周一", 2 => "周二", 3 => "周三", 4 => "周四", 5 => "周五", 6 => "周六", _ => $"星期{weekday}"
+    };
+
+    private static string FindOrCreateSubject(JsonObject subjects, string subjectName, JsonArray createdSubjectInfo)
+    {
+        var existing = subjects.FirstOrDefault(x => x.Value is JsonObject subject && string.Equals(subject["Name"]?.GetValue<string>(), subjectName, StringComparison.OrdinalIgnoreCase));
+        if (existing.Key is not null) return existing.Key;
+        var id = Guid.NewGuid().ToString();
+        subjects[id] = new JsonObject { ["Name"] = subjectName, ["Initial"] = subjectName[..Math.Min(1, subjectName.Length)], ["TeacherName"] = "", ["IsOutDoor"] = false };
+        createdSubjectInfo.Add(new JsonObject { ["id"] = id, ["name"] = subjectName });
+        return id;
+    }
+
+    private sealed record TimetableDay(int Weekday, string Name, List<TimetableRow> Rows);
+    private sealed record TimetableRow(TimeSpan Start, TimeSpan End, int TimeType, string Subject, string Label);
+
+    private static void ValidateProfileCandidate(JsonNode node)
+    {
+        if (node is not JsonObject profile) throw new InvalidDataException("档案根节点必须是 JSON 对象。");
+
+        var timeLayoutCounts = new Dictionary<string, int>(StringComparer.OrdinalIgnoreCase);
+        if (profile["TimeLayouts"] is JsonObject timeLayouts)
+        {
+            foreach (var item in timeLayouts)
+            {
+                if (item.Value is not JsonObject layout) throw new InvalidDataException($"时间表 {item.Key} 必须是对象。");
+                if (layout["Layouts"] is not JsonArray layouts) throw new InvalidDataException($"时间表 {item.Key} 缺少 Layouts 数组。");
+                var classCount = 0;
+                foreach (var rawPoint in layouts)
+                {
+                    if (rawPoint is not JsonObject point) throw new InvalidDataException($"时间表 {item.Key} 的时间点必须是对象。");
+                    var timeType = point["TimeType"]?.GetValue<int>() ?? throw new InvalidDataException($"时间表 {item.Key} 的时间点缺少 TimeType。");
+                    if (timeType == 0) classCount++;
+                    if (point.ContainsKey("DefaultClassId") && point["DefaultClassId"] is null)
+                        throw new InvalidDataException($"时间表 {item.Key} 的 DefaultClassId 不能是 null；请使用空 GUID 字符串或省略该字段。");
+                }
+                timeLayoutCounts[item.Key] = classCount;
+            }
+        }
+
+        if (profile["ClassPlans"] is JsonObject classPlans)
+        {
+            foreach (var item in classPlans)
+            {
+                if (item.Value is not JsonObject plan) throw new InvalidDataException($"课表 {item.Key} 必须是对象。");
+                var timeLayoutId = plan["TimeLayoutId"]?.GetValue<string>();
+                if (string.IsNullOrWhiteSpace(timeLayoutId)) throw new InvalidDataException($"课表 {item.Key} 缺少 TimeLayoutId。");
+                if (!Guid.TryParse(timeLayoutId, out _)) throw new InvalidDataException($"课表 {item.Key} 的 TimeLayoutId 不是有效 GUID。");
+                if (plan["Classes"] is not JsonArray classes) throw new InvalidDataException($"课表 {item.Key} 缺少 Classes 数组。");
+                var matchingLayout = timeLayoutCounts.FirstOrDefault(x => string.Equals(x.Key, timeLayoutId, StringComparison.OrdinalIgnoreCase));
+                if (matchingLayout.Key is not null && classes.Count != matchingLayout.Value)
+                    throw new InvalidDataException($"课表 {item.Key} 的 Classes 数量为 {classes.Count}，但对应时间表只有 {matchingLayout.Value} 个上课时间点；课间不应放入 Classes。");
+                foreach (var rawClass in classes)
+                {
+                    if (rawClass is not JsonObject classInfo) throw new InvalidDataException($"课表 {item.Key} 的课程项必须是对象。");
+                    var subjectId = classInfo["SubjectId"]?.GetValue<string>();
+                    if (!string.IsNullOrWhiteSpace(subjectId) && !Guid.TryParse(subjectId, out _)) throw new InvalidDataException($"课表 {item.Key} 的 SubjectId 不是有效 GUID。");
+                }
+            }
+        }
+
+        if (profile["OrderedSchedules"] is JsonObject schedules)
+        {
+            foreach (var item in schedules)
+            {
+                if (item.Value is not JsonObject schedule) throw new InvalidDataException($"预定课表 {item.Key} 必须是对象，格式应为 {{\"ClassPlanId\":\"课表 GUID\"}}。");
+                var classPlanId = schedule["ClassPlanId"]?.GetValue<string>();
+                if (!Guid.TryParse(classPlanId, out _)) throw new InvalidDataException($"预定课表 {item.Key} 的 ClassPlanId 不是有效 GUID。");
+            }
+        }
+    }
+
+    private static void ValidateProfileReferences(JsonNode node)
+    {
+        if (node is not JsonObject profile) throw new InvalidDataException("档案根节点必须是 JSON 对象。");
+        var layouts = profile["TimeLayouts"] as JsonObject ?? new JsonObject();
+        var subjects = profile["Subjects"] as JsonObject ?? new JsonObject();
+        var groups = profile["ClassPlanGroups"] as JsonObject ?? new JsonObject();
+        var plans = profile["ClassPlans"] as JsonObject ?? new JsonObject();
+        foreach (var item in plans)
+        {
+            if (item.Value is not JsonObject plan) continue;
+            var layoutId = plan["TimeLayoutId"]?.GetValue<string>();
+            if (layoutId is null || !layouts.ContainsKey(layoutId)) throw new InvalidDataException($"课表 {item.Key} 引用的 TimeLayoutId 不存在：{layoutId}");
+            var groupId = plan["AssociatedGroup"]?.GetValue<string>();
+            if (groupId is not null && !groups.ContainsKey(groupId)) throw new InvalidDataException($"课表 {item.Key} 引用的 AssociatedGroup 不存在：{groupId}");
+            if (plan["Classes"] is JsonArray classes)
+                foreach (var rawClass in classes)
+                {
+                    var subjectId = (rawClass as JsonObject)?["SubjectId"]?.GetValue<string>();
+                    if (!string.IsNullOrWhiteSpace(subjectId) && !subjects.ContainsKey(subjectId)) throw new InvalidDataException($"课表 {item.Key} 引用的 SubjectId 不存在：{subjectId}");
+                }
+        }
+        if (profile["OrderedSchedules"] is JsonObject schedules)
+            foreach (var schedule in schedules)
+            {
+                var planId = (schedule.Value as JsonObject)?["ClassPlanId"]?.GetValue<string>();
+                if (planId is null || !plans.ContainsKey(planId)) throw new InvalidDataException($"预定课表 {schedule.Key} 引用的 ClassPlanId 不存在：{planId}");
+            }
+    }
+
+    private static bool TryReloadCurrentProfile(string profileName, out string? error)
+    {
+        error = null;
+        try
+        {
+            var service = IAppHost.Host?.Services.GetService<IProfileService>();
+            if (service is null || !string.Equals(Path.GetFileName(service.CurrentProfilePath), profileName, StringComparison.OrdinalIgnoreCase)) return false;
+            var method = service.GetType().GetMethod("LoadProfileAsync", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            if (method?.Invoke(service, null) is not Task task) throw new InvalidOperationException("ClassIsland 档案服务不支持重新加载当前档案。");
+            task.GetAwaiter().GetResult();
+            return true;
+        }
+        catch (Exception ex)
+        {
+            error = ex.GetBaseException().Message;
+            return false;
+        }
     }
 
     private static JsonNode SelectPath(JsonNode root, string expression)
@@ -559,6 +716,298 @@ internal sealed class SecAgentBridge : IDisposable
         return new JsonObject { ["config_file"] = "Settings.json", ["settings"] = JsonNode.Parse(File.ReadAllText(MainConfigPath)) ?? throw new InvalidDataException("主配置不是有效 JSON。") };
     }
 
+    private static JsonObject ListMainSettings(JsonElement arguments)
+    {
+        var assembly = AppBase.Current.GetType().Assembly;
+        var settingsType = assembly.GetType("ClassIsland.Models.Settings") ?? throw new InvalidOperationException("无法找到 ClassIsland Settings 类型。");
+        var serviceType = assembly.GetType("ClassIsland.Services.SettingsService");
+        var service = serviceType is null ? null : IAppHost.Host?.Services.GetService(serviceType);
+        var runtimeSettings = serviceType?.GetProperty("Settings")?.GetValue(service);
+        var includeValues = !arguments.TryGetProperty("include_values", out var includeElement) || includeElement.ValueKind != JsonValueKind.False;
+        var properties = new JsonArray();
+        foreach (var property in settingsType.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                     .Where(x => x.GetIndexParameters().Length == 0 && x.CanRead)
+                     .OrderBy(x => x.Name))
+        {
+            if (property.GetCustomAttribute<System.Text.Json.Serialization.JsonIgnoreAttribute>() is not null) continue;
+            var item = new JsonObject
+            {
+                ["name"] = property.Name,
+                ["json_name"] = property.GetCustomAttribute<System.Text.Json.Serialization.JsonPropertyNameAttribute>()?.Name ?? property.Name,
+                ["type"] = property.PropertyType.FullName ?? property.PropertyType.Name,
+                ["writable"] = property.CanWrite
+            };
+            if (property.PropertyType.IsEnum)
+            {
+                var enumValues = new JsonArray();
+                foreach (var enumName in property.PropertyType.GetEnumNames()) enumValues.Add(enumName);
+                item["enum"] = enumValues;
+            }
+            if (includeValues && runtimeSettings is not null)
+            {
+                try { item["current"] = JsonSerializer.SerializeToNode(property.GetValue(runtimeSettings), property.PropertyType); }
+                catch { }
+            }
+            properties.Add(item);
+        }
+        return new JsonObject { ["settings_type"] = settingsType.FullName, ["settings"] = properties };
+    }
+
+    private static string ComponentConfigDirectoryPath => Path.Combine(CommonDirectories.AppRootFolderPath, "Config", "ComponentLayouts");
+
+    private static JsonObject ListComponentConfigs()
+    {
+        var configs = Directory.Exists(ComponentConfigDirectoryPath)
+            ? Directory.EnumerateFiles(ComponentConfigDirectoryPath, "*.json").OrderBy(x => x).Select(x => (JsonNode)new JsonObject { ["name"] = Path.GetFileName(x) }).ToArray()
+            : Array.Empty<JsonNode>();
+        return new JsonObject
+        {
+            ["config_directory"] = "Config/ComponentLayouts",
+            ["active_config"] = ReadCurrentComponentConfig(),
+            ["configs"] = new JsonArray(configs)
+        };
+    }
+
+    private static JsonObject ListComponents(JsonElement arguments = default)
+    {
+        var configName = ResolveComponentConfigName(arguments);
+        var configPath = Path.Combine(ComponentConfigDirectoryPath, configName);
+        if (!File.Exists(configPath)) throw new FileNotFoundException("组件配置不存在。", configName);
+        var root = JsonNode.Parse(File.ReadAllText(configPath)) ?? throw new InvalidDataException("组件配置不是有效 JSON。");
+        var runtimeById = ReadRuntimeComponentMetadata().Where(x => x["component_id"] is not null).ToDictionary(x => x["component_id"]!.GetValue<string>(), StringComparer.OrdinalIgnoreCase);
+        var components = new JsonArray();
+        foreach (var (path, node) in EnumerateComponentNodes(root, ""))
+        {
+            var id = node["Id"]?.GetValue<string>() ?? "";
+            var runtime = runtimeById.TryGetValue(id, out var matched) ? matched : null;
+            var common = new JsonObject();
+            foreach (var property in node.AsObject())
+            {
+                if (property.Key is "Id" or "NameCache" or "Settings" or "Children") continue;
+                common[property.Key] = property.Value?.DeepClone();
+            }
+            var item = new JsonObject
+            {
+                ["path"] = path,
+                ["component_id"] = id,
+                ["name"] = runtime?["name"]?.DeepClone() ?? node["NameCache"]?.DeepClone() ?? "",
+                ["type"] = runtime?["type"]?.DeepClone() ?? node["Settings"]?.GetType().Name ?? "Unknown",
+                ["runtime_type"] = runtime?["runtime_type"]?.DeepClone(),
+                ["settings_type"] = runtime?["settings_type"]?.DeepClone(),
+                ["common_settings"] = common,
+                ["settings"] = node["Settings"]?.DeepClone()
+            };
+            if (runtime?["settings_fields"] is { } fields) item["settings_fields"] = fields.DeepClone();
+            components.Add(item);
+        }
+        return new JsonObject { ["config_name"] = configName, ["active_config"] = ReadCurrentComponentConfig(), ["components"] = components };
+    }
+
+    private static JsonObject UpdateComponent(JsonElement arguments)
+    {
+        var configName = ResolveComponentConfigName(arguments);
+        if (!arguments.TryGetProperty("component_id", out var idElement) || idElement.ValueKind != JsonValueKind.String) throw new ArgumentException("component_id 必须是字符串。");
+        var id = idElement.GetString()!;
+        var commonPatch = arguments.TryGetProperty("common_patch", out var commonElement) ? commonElement : default;
+        var settingsPatch = arguments.TryGetProperty("settings_patch", out var settingsElement) ? settingsElement : default;
+        if ((commonPatch.ValueKind != JsonValueKind.Object) && (settingsPatch.ValueKind != JsonValueKind.Object)) throw new ArgumentException("请提供 common_patch 或 settings_patch。");
+
+        var configPath = Path.Combine(ComponentConfigDirectoryPath, configName);
+        if (!File.Exists(configPath)) throw new FileNotFoundException("组件配置不存在。", configName);
+        var root = JsonNode.Parse(File.ReadAllText(configPath)) ?? throw new InvalidDataException("组件配置不是有效 JSON。");
+        var match = EnumerateComponentNodes(root, "").FirstOrDefault(x => string.Equals(x.Node["Id"]?.GetValue<string>(), id, StringComparison.OrdinalIgnoreCase));
+        if (match.Node is null) throw new KeyNotFoundException($"找不到组件 ID：{id}");
+
+        var updated = new JsonArray();
+        if (commonPatch.ValueKind == JsonValueKind.Object)
+        {
+            var patch = JsonNode.Parse(commonPatch.GetRawText())!.AsObject();
+            foreach (var property in patch)
+            {
+                if (property.Key is "Id" or "NameCache" or "Settings" or "Children") throw new ArgumentException($"不能通过 common_patch 修改组件结构字段：{property.Key}");
+                var actual = match.Node.AsObject().FirstOrDefault(x => string.Equals(x.Key, property.Key, StringComparison.OrdinalIgnoreCase));
+                if (actual.Key is null) throw new KeyNotFoundException($"组件通用设置不存在：{property.Key}");
+                match.Node[actual.Key] = property.Value?.DeepClone();
+                updated.Add($"{match.Path}.{actual.Key}");
+            }
+        }
+        if (settingsPatch.ValueKind == JsonValueKind.Object)
+        {
+            if (match.Node["Settings"] is not JsonObject settings) throw new InvalidOperationException("该组件没有专属 Settings；请使用 common_patch 修改通用高级设置。");
+            var patch = JsonNode.Parse(settingsPatch.GetRawText())!.AsObject();
+            MergeObject(settings, patch);
+            foreach (var property in patch.Select(x => x.Key)) updated.Add($"{match.Path}.Settings.{property}");
+        }
+        WriteJsonAtomically(configPath, root);
+        var refreshed = TryRefreshComponentConfigs(out var refreshError);
+        var result = new JsonObject
+        {
+            ["config_name"] = configName,
+            ["component_id"] = id,
+            ["path"] = match.Path,
+            ["written"] = true,
+            ["updated_paths"] = updated,
+            ["backup"] = configPath + ".bak",
+            ["runtime_refreshed"] = refreshed
+        };
+        if (refreshError is not null) result["runtime_refresh_error"] = refreshError;
+        return result;
+    }
+
+    private static string ResolveComponentConfigName(JsonElement arguments)
+    {
+        if (arguments.ValueKind == JsonValueKind.Object && arguments.TryGetProperty("config_name", out var value) && value.ValueKind == JsonValueKind.String) return SafeJsonFileName(value.GetString()!);
+        var active = ReadCurrentComponentConfig();
+        return string.IsNullOrWhiteSpace(active) ? "Default.json" : SafeJsonFileName(active.EndsWith(".json", StringComparison.OrdinalIgnoreCase) ? active : active + ".json");
+    }
+
+    private static IEnumerable<(string Path, JsonObject Node)> EnumerateComponentNodes(JsonNode root, string path)
+    {
+        if (root is not JsonObject obj) yield break;
+        if (obj["Id"] is JsonValue) yield return (path, obj);
+        if (obj["Lines"] is JsonArray lines)
+            for (var index = 0; index < lines.Count; index++)
+                if (lines[index] is { } line) foreach (var item in EnumerateComponentNodes(line, $"Lines.{index}")) yield return item;
+        if (obj["Children"] is JsonArray children)
+            for (var index = 0; index < children.Count; index++)
+                if (children[index] is { } child) foreach (var item in EnumerateComponentNodes(child, $"{path}.Children.{index}".TrimStart('.'))) yield return item;
+    }
+
+    private static List<JsonObject> ReadRuntimeComponentMetadata()
+    {
+        var output = new List<JsonObject>();
+        try
+        {
+            var service = IAppHost.Host?.Services.GetService<IComponentsService>();
+            if (service is null) return output;
+            for (var lineIndex = 0; lineIndex < service.CurrentComponents.Lines.Count; lineIndex++)
+            {
+                var line = service.CurrentComponents.Lines[lineIndex];
+                for (var childIndex = 0; childIndex < line.Children.Count; childIndex++)
+                    AppendRuntimeComponentMetadata(line.Children[childIndex], $"Lines.{lineIndex}.Children.{childIndex}", output);
+            }
+        }
+        catch { }
+        return output;
+    }
+
+    private static void AppendRuntimeComponentMetadata(ComponentSettings settings, string path, ICollection<JsonObject> output)
+    {
+        var info = settings.AssociatedComponentInfo;
+        var fields = new JsonArray();
+        if (info.SettingsType is not null)
+        {
+            foreach (var property in info.SettingsType.GetProperties(BindingFlags.Public | BindingFlags.Instance)
+                         .Where(x => x.CanRead && x.GetIndexParameters().Length == 0)
+                         .OrderBy(x => x.Name))
+            {
+                var field = new JsonObject
+                {
+                    ["name"] = property.Name,
+                    ["type"] = property.PropertyType.FullName ?? property.PropertyType.Name
+                };
+                if (property.PropertyType.IsEnum)
+                {
+                    var enumValues = new JsonArray();
+                    foreach (var enumName in property.PropertyType.GetEnumNames()) enumValues.Add(enumName);
+                    field["enum"] = enumValues;
+                }
+                try
+                {
+                    var value = settings.Settings?.GetType().GetProperty(property.Name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase)?.GetValue(settings.Settings);
+                    field["current"] = JsonSerializer.SerializeToNode(value, property.PropertyType);
+                }
+                catch { }
+                fields.Add(field);
+            }
+        }
+
+        output.Add(new JsonObject
+        {
+            ["path"] = path,
+            ["component_id"] = settings.Id,
+            ["name"] = info.Name,
+            ["description"] = info.Description,
+            ["type"] = info.ComponentType?.FullName,
+            ["runtime_type"] = info.ComponentType?.AssemblyQualifiedName,
+            ["settings_type"] = info.SettingsType?.FullName,
+            ["source"] = info.ComponentType?.Assembly.GetName().Name,
+            ["is_container"] = info.IsComponentContainer,
+            ["settings_fields"] = fields
+        });
+
+        if (settings.Children is not null)
+            for (var index = 0; index < settings.Children.Count; index++)
+                AppendRuntimeComponentMetadata(settings.Children[index], $"{path}.Children.{index}", output);
+    }
+
+    private static object? GetPropertyValue(object? instance, string name) => instance?.GetType().GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.IgnoreCase)?.GetValue(instance);
+    private static string? GetStringProperty(object? instance, string name) => GetPropertyValue(instance, name)?.ToString();
+
+    private static JsonObject ReadComponentConfig(JsonElement arguments)
+    {
+        var name = SafeJsonFileName(arguments, "config_name");
+        var pathExpression = arguments.TryGetProperty("path", out var pathElement) && pathElement.ValueKind == JsonValueKind.String
+            ? pathElement.GetString()!
+            : throw new ArgumentException("path 必须是字符串；使用空字符串才请求完整组件配置。");
+        var path = Path.Combine(ComponentConfigDirectoryPath, name);
+        if (!File.Exists(path)) throw new FileNotFoundException("组件配置不存在。", name);
+        var config = JsonNode.Parse(File.ReadAllText(path)) ?? throw new InvalidDataException("组件配置不是有效 JSON。");
+        return new JsonObject { ["config_name"] = name, ["path"] = pathExpression, ["active_config"] = ReadCurrentComponentConfig(), ["value"] = SelectPath(config, pathExpression) };
+    }
+
+    private static JsonObject WriteComponentConfig(JsonElement arguments)
+    {
+        var name = SafeJsonFileName(arguments, "config_name");
+        var pathExpression = arguments.TryGetProperty("path", out var pathElement) && pathElement.ValueKind == JsonValueKind.String ? pathElement.GetString() : null;
+        var hasPatch = arguments.TryGetProperty("patch", out var patchElement);
+        var hasValue = arguments.TryGetProperty("value", out var valueElement);
+        if (string.IsNullOrWhiteSpace(pathExpression) && (!hasPatch || patchElement.ValueKind != JsonValueKind.Object)) throw new ArgumentException("请提供 patch 对象，或同时提供非空 path 和 value。");
+        if (!string.IsNullOrWhiteSpace(pathExpression) && !hasValue) throw new ArgumentException("使用 path 时必须提供 value。");
+
+        var path = Path.Combine(ComponentConfigDirectoryPath, name);
+        if (!File.Exists(path)) throw new FileNotFoundException("组件配置不存在。", name);
+        var config = JsonNode.Parse(File.ReadAllText(path)) ?? throw new InvalidDataException("组件配置不是有效 JSON。");
+        if (string.IsNullOrWhiteSpace(pathExpression)) MergeObject(config, JsonNode.Parse(patchElement.GetRawText())!.AsObject());
+        else SetPath(config, pathExpression!, JsonNode.Parse(valueElement.GetRawText()));
+        WriteJsonAtomically(path, config);
+
+        var refreshed = TryRefreshComponentConfigs(out var refreshError);
+        var result = new JsonObject
+        {
+            ["config_name"] = name,
+            ["written"] = true,
+            ["backup"] = path + ".bak",
+            ["runtime_refreshed"] = refreshed
+        };
+        if (refreshError is not null) result["runtime_refresh_error"] = refreshError;
+        return result;
+    }
+
+    private static string? ReadCurrentComponentConfig()
+    {
+        try
+        {
+            if (!File.Exists(MainConfigPath)) return null;
+            var settings = JsonNode.Parse(File.ReadAllText(MainConfigPath)) as JsonObject;
+            return settings?["CurrentComponentConfig"]?.GetValue<string>();
+        }
+        catch { return null; }
+    }
+
+    private static bool TryRefreshComponentConfigs(out string? error)
+    {
+        try
+        {
+            var service = IAppHost.Host?.Services.GetService<IComponentsService>();
+            if (service is null) { error = "ClassIsland 组件服务当前不可用；配置已写入磁盘，重启后会加载。"; return false; }
+            service.RefreshConfigs();
+            error = null;
+            return true;
+        }
+        catch (Exception ex) { error = ex.Message; return false; }
+    }
+
     private static JsonObject UpdateMainConfig(JsonElement arguments)
     {
         if (!arguments.TryGetProperty("patch", out var patch) || patch.ValueKind != JsonValueKind.Object) throw new ArgumentException("patch 必须是 JSON 对象。");
@@ -596,7 +1045,7 @@ internal sealed class SecAgentBridge : IDisposable
         }
 
         var saveMethod = serviceType.GetMethod("SaveSettings", new[] { typeof(string) });
-        saveMethod?.Invoke(service, new object[] { "SecAgent MCP 更新主配置" });
+        saveMethod?.Invoke(service, new object[] { "SecAgent HTTP API 更新主配置" });
         return true;
     }
 
@@ -620,6 +1069,18 @@ internal sealed class SecAgentBridge : IDisposable
         return name;
     }
 
+    private static string SafeJsonFileName(JsonElement arguments, string property)
+    {
+        if (!arguments.TryGetProperty(property, out var value) || value.ValueKind != JsonValueKind.String) throw new ArgumentException($"{property} 必须是字符串。");
+        return SafeJsonFileName(value.GetString()!);
+    }
+
+    private static string SafeJsonFileName(string name)
+    {
+        if (string.IsNullOrWhiteSpace(name) || !string.Equals(Path.GetFileName(name), name, StringComparison.Ordinal) || !name.EndsWith(".json", StringComparison.OrdinalIgnoreCase)) throw new ArgumentException("组件配置名必须是当前目录下的 .json 文件名。");
+        return name;
+    }
+
     private static void WriteJsonAtomically(string path, JsonNode node)
     {
         Directory.CreateDirectory(Path.GetDirectoryName(path)!);
@@ -629,9 +1090,12 @@ internal sealed class SecAgentBridge : IDisposable
         finally { if (File.Exists(temp)) File.Delete(temp); }
     }
 
-    private static JsonNode Initialize(JsonNode? id) => RpcResult(id, new JsonObject { ["protocolVersion"] = "2025-03-26", ["capabilities"] = new JsonObject { ["tools"] = new JsonObject() }, ["serverInfo"] = new JsonObject { ["name"] = "classisland", ["version"] = AppBase.AppVersion } });
-    private static JsonNode RpcResult(JsonNode? id, JsonNode result) => new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id, ["result"] = result };
-    private static JsonNode Error(JsonNode? id, int code, string message) => new JsonObject { ["jsonrpc"] = "2.0", ["id"] = id, ["error"] = new JsonObject { ["code"] = code, ["message"] = message } };
-
-    public void Dispose() { _cts?.Cancel(); _listener.Stop(); _listener.Close(); _cts?.Dispose(); _cts = null; }
+    public void Dispose()
+    {
+        try { _cts?.Cancel(); } catch { }
+        try { _listener.Stop(); } catch { }
+        try { _listener.Close(); } catch { }
+        _cts?.Dispose();
+        _cts = null;
+    }
 }
