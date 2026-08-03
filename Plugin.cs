@@ -1,5 +1,6 @@
 using System.Net;
 using System.Net.Http.Json;
+using System.Globalization;
 using System.Reflection;
 using System.Text;
 using System.Text.Json;
@@ -101,6 +102,7 @@ public sealed class HttpApiServer : IDisposable
     private const string VersionTool = "get_classisland_version_status";
     private const string ListProfilesTool = "list_classisland_profiles";
     private const string ReadProfileTool = "read_classisland_profile";
+    private const string GetScheduleTool = "get_classisland_schedule";
     private const string WriteProfileTool = "write_classisland_profile";
     private const string CreateProfileFromTimetableTool = "create_classisland_profile_from_timetable";
     private const string ReadMainConfigTool = "read_classisland_main_config";
@@ -178,6 +180,7 @@ public sealed class HttpApiServer : IDisposable
         Tool(VersionTool, "获取当前 ClassIsland 的版本和运行状态。", EmptySchema()),
         Tool(ListProfilesTool, "列出 ClassIsland 档案。", EmptySchema()),
         Tool(ReadProfileTool, "按路径读取 ClassIsland 档案片段。", ProfileReadSchema()),
+        Tool(GetScheduleTool, "获取今天或指定日期的课程安排；这是面向日常查询的快捷只读工具。", ScheduleSchema(), hidden: false),
         Tool(WriteProfileTool, "对 ClassIsland 档案执行差量更新。", ProfileWriteSchema()),
         Tool(ReadMainConfigTool, "读取 ClassIsland 主配置。", EmptySchema()),
         Tool(ListMainSettingsTool, "列出 ClassIsland 可持久化主设置的类型、当前值和枚举选项。", MainSettingsListSchema()),
@@ -188,12 +191,12 @@ public sealed class HttpApiServer : IDisposable
         Tool(WriteComponentConfigTool, "修改 ClassIsland 主界面组件配置。", ComponentConfigWriteSchema()),
         Tool(UpdateComponentTool, "按组件 ID 修改 ClassIsland 组件的通用高级设置或专属设置。", ComponentUpdateSchema()));
 
-    private static JsonObject Tool(string name, string description, JsonObject schema) => new()
+    private static JsonObject Tool(string name, string description, JsonObject schema, bool hidden = true) => new()
     {
         ["name"] = name,
         ["description"] = description,
         ["inputSchema"] = schema,
-        ["hidden"] = true
+        ["hidden"] = hidden
     };
 
     private static JsonObject EmptySchema() => new()
@@ -213,6 +216,16 @@ public sealed class HttpApiServer : IDisposable
         ["type"] = "object",
         ["properties"] = new JsonObject { ["profile_name"] = new JsonObject { ["type"] = "string" }, ["path"] = new JsonObject { ["type"] = "string", ["description"] = "点号分隔路径，例如 ClassPlans 或 ClassPlans.字典键；空字符串返回完整 JSON。" } },
         ["required"] = new JsonArray("profile_name", "path"), ["additionalProperties"] = false
+    };
+
+    private static JsonObject ScheduleSchema() => new()
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["date"] = new JsonObject { ["type"] = "string", ["pattern"] = "^\\d{4}-\\d{2}-\\d{2}$", ["description"] = "可选，格式 YYYY-MM-DD；省略时查询今天。" }
+        },
+        ["additionalProperties"] = false
     };
 
     private static JsonObject ProfileWriteSchema() => new()
@@ -339,6 +352,7 @@ public sealed class HttpApiServer : IDisposable
             VersionTool => VersionStatus(),
             ListProfilesTool => ListProfiles(),
             ReadProfileTool => ReadProfile(arguments),
+            GetScheduleTool => GetSchedule(arguments),
             WriteProfileTool => WriteProfile(arguments),
             CreateProfileFromTimetableTool => CreateProfileFromTimetable(arguments),
             ReadMainConfigTool => ReadMainConfig(),
@@ -380,6 +394,146 @@ public sealed class HttpApiServer : IDisposable
         if (!File.Exists(path)) throw new FileNotFoundException("档案不存在。", name);
         var profile = JsonNode.Parse(File.ReadAllText(path)) ?? throw new InvalidDataException("档案不是有效 JSON。");
         return new JsonObject { ["profile_name"] = name, ["path"] = pathExpression, ["value"] = SelectPath(profile, pathExpression) };
+    }
+
+    private static JsonObject GetSchedule(JsonElement arguments)
+    {
+        var dateText = OptionalString(arguments, "date");
+        DateTime targetDate;
+        if (string.IsNullOrWhiteSpace(dateText)) targetDate = DateTime.Today;
+        else if (!DateTime.TryParseExact(dateText, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out targetDate))
+            throw new ArgumentException("date 必须是 YYYY-MM-DD 格式，例如 2026-08-03。");
+
+        var profileService = IAppHost.Host?.Services.GetService<IProfileService>() ?? throw new InvalidOperationException("ClassIsland 当前没有可用的档案服务。");
+        var profilePath = profileService.CurrentProfilePath;
+        if (string.IsNullOrWhiteSpace(profilePath) || !File.Exists(profilePath)) throw new FileNotFoundException("ClassIsland 当前档案不存在。", profilePath);
+        var profile = JsonNode.Parse(File.ReadAllText(profilePath)) as JsonObject ?? throw new InvalidDataException("ClassIsland 当前档案不是有效 JSON 对象。");
+        var plans = profile["ClassPlans"] as JsonObject ?? new JsonObject();
+        var scheduledPlanId = FindOrderedSchedulePlanId(profile, targetDate);
+        var selectedPlanId = scheduledPlanId;
+        var selectionSource = scheduledPlanId is null ? "weekday_rule" : "ordered_schedule";
+
+        if (selectedPlanId is null || plans[selectedPlanId] is not JsonObject)
+        {
+            var weekday = (int)targetDate.DayOfWeek;
+            var candidates = plans
+                .Where(item => item.Value is JsonObject plan && IsPlanEnabled(plan) && IsPlanForWeekday(plan, weekday))
+                .ToList();
+            var selectedGroupId = NodeString(profile["SelectedClassPlanGroupId"]);
+            var groupMatch = candidates.FirstOrDefault(item => string.IsNullOrWhiteSpace(selectedGroupId) || string.Equals(NodeString((item.Value as JsonObject)?["AssociatedGroup"]), selectedGroupId, StringComparison.OrdinalIgnoreCase));
+            var selected = groupMatch.Value is not null ? groupMatch : candidates.FirstOrDefault();
+            selectedPlanId = selected.Key;
+        }
+
+        var result = new JsonObject
+        {
+            ["date"] = targetDate.ToString("yyyy-MM-dd"),
+            ["weekday"] = WeekdayName((int)targetDate.DayOfWeek),
+            ["profile_name"] = Path.GetFileName(profilePath),
+            ["profile_display_name"] = NodeString(profile["Name"])
+        };
+
+        if (selectedPlanId is null || plans[selectedPlanId] is not JsonObject plan)
+        {
+            result["has_schedule"] = false;
+            result["entries"] = new JsonArray();
+            result["message"] = $"{targetDate:yyyy-MM-dd} 没有找到匹配的课表。";
+            result["available_plans"] = new JsonArray(plans.Select(item => (JsonNode)new JsonObject { ["id"] = item.Key, ["name"] = NodeString((item.Value as JsonObject)?["Name"]) }).ToArray());
+            return result;
+        }
+
+        var layouts = profile["TimeLayouts"] as JsonObject ?? new JsonObject();
+        var subjects = profile["Subjects"] as JsonObject ?? new JsonObject();
+        var layoutId = NodeString(plan["TimeLayoutId"]);
+        var layout = layouts[layoutId] as JsonObject;
+        var timePoints = layout?["Layouts"] as JsonArray ?? new JsonArray();
+        var classes = plan["Classes"] as JsonArray ?? new JsonArray();
+        var entries = new JsonArray();
+        var classIndex = 0;
+        foreach (var rawPoint in timePoints)
+        {
+            if (rawPoint is not JsonObject point) continue;
+            var timeType = NodeInt(point["TimeType"]) ?? 0;
+            var entry = new JsonObject
+            {
+                ["type"] = timeType switch { 0 => "lesson", 1 => "break", 2 => "line", 3 => "action", _ => "other" },
+                ["start"] = NodeString(point["StartTime"]),
+                ["end"] = NodeString(point["EndTime"])
+            };
+            if (timeType == 0)
+            {
+                entry["period"] = classIndex + 1;
+                var classInfo = classIndex < classes.Count ? classes[classIndex] as JsonObject : null;
+                var subjectId = NodeString(classInfo?["SubjectId"]);
+                var subject = subjects[subjectId] as JsonObject;
+                entry["subject"] = NodeString(subject?["Name"]);
+                entry["teacher"] = NodeString(subject?["TeacherName"]);
+                entry["subject_id"] = subjectId;
+                classIndex++;
+            }
+            else if (timeType == 1)
+            {
+                entry["label"] = NodeString(point["BreakName"]);
+            }
+            entries.Add(entry);
+        }
+
+        result["has_schedule"] = true;
+        result["selection_source"] = selectionSource;
+        result["plan"] = new JsonObject { ["id"] = selectedPlanId, ["name"] = NodeString(plan["Name"]), ["time_layout_id"] = layoutId, ["time_layout_name"] = NodeString(layout?["Name"]) };
+        result["lesson_count"] = classIndex;
+        result["entries"] = entries;
+        return result;
+    }
+
+    private static string? FindOrderedSchedulePlanId(JsonObject profile, DateTime targetDate)
+    {
+        if (profile["OrderedSchedules"] is not JsonObject schedules) return null;
+        foreach (var item in schedules)
+        {
+            if (!ScheduleKeyMatches(item.Key, targetDate) || item.Value is not JsonObject schedule) continue;
+            var planId = NodeString(schedule["ClassPlanId"]);
+            if (!string.IsNullOrWhiteSpace(planId)) return planId;
+        }
+        return null;
+    }
+
+    private static bool ScheduleKeyMatches(string key, DateTime targetDate)
+    {
+        var date = targetDate.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture);
+        if (key.StartsWith(date, StringComparison.OrdinalIgnoreCase)) return true;
+        return DateTime.TryParse(key, CultureInfo.InvariantCulture, DateTimeStyles.AssumeLocal, out var parsed) && parsed.Date == targetDate.Date;
+    }
+
+    private static bool IsPlanForWeekday(JsonObject plan, int weekday)
+    {
+        var rule = plan["TimeRule"] as JsonObject;
+        return (NodeInt(rule?["WeekDay"]) ?? NodeInt(rule?["Weekday"])) == weekday;
+    }
+
+    private static bool IsPlanEnabled(JsonObject plan)
+        => NodeBool(plan["IsEnabled"]) ?? true;
+
+    private static string NodeString(JsonNode? node)
+    {
+        try { return node?.GetValue<string>()?.Trim() ?? ""; }
+        catch { return ""; }
+    }
+
+    private static int? NodeInt(JsonNode? node)
+    {
+        try { return node?.GetValue<int>(); }
+        catch { }
+        if (int.TryParse(NodeString(node), out var value)) return value;
+        return null;
+    }
+
+    private static bool? NodeBool(JsonNode? node)
+    {
+        try { return node?.GetValue<bool>(); }
+        catch { }
+        if (bool.TryParse(NodeString(node), out var value)) return value;
+        return null;
     }
 
     private static JsonObject WriteProfile(JsonElement arguments)
