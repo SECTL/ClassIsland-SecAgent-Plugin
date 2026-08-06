@@ -10,3 +10,5 @@ node_modules/
 *.suo
 *.pdb
 *.dll
+
+.codewhale/*
