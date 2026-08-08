@@ -189,7 +189,7 @@ public sealed class HttpApiServer : IDisposable
         Tool(WriteProfileTool, "对 ClassIsland 档案执行差量更新。", ProfileWriteSchema()),
         Tool(ReadMainConfigTool, "读取 ClassIsland 主配置。", EmptySchema()),
         Tool(ListMainSettingsTool, "列出 ClassIsland 可持久化主设置的类型、当前值和枚举选项。", MainSettingsListSchema()),
-        Tool(UpdateMainConfigTool, "按属性更新 ClassIsland 主配置。参数格式：{\"patch\":{\"字段名\":新值}}，例如 {\"patch\":{\"TimeOffsetSeconds\":-5}} 或 {\"patch\":{\"Scale\":1.2}}。", ObjectSchema(("patch", "object"))),
+        Tool(UpdateMainConfigTool, "按属性更新 ClassIsland 主配置。参数键名必须是 patch（不是 settings_patch，那是组件工具的键），patch 可以是 JSON 对象或 JSON 字符串。正确格式：{\"patch\":{\"字段名\":新值}}，例如 {\"patch\":{\"TimeOffsetSeconds\":-5}} 或 {\"patch\":{\"Scale\":1.2}}。", ObjectSchema(("patch", "object"))),
         Tool(ListComponentConfigsTool, "列出 ClassIsland 主界面组件配置。", EmptySchema()),
         Tool(ListComponentsTool, "列出 ClassIsland 主界面的组件、名称、类型和通用高级设置。", ComponentListSchema()),
         Tool(ReadComponentConfigTool, "读取 ClassIsland 主界面组件配置。", ComponentConfigReadSchema()),
@@ -1466,9 +1466,42 @@ public sealed class HttpApiServer : IDisposable
         catch (Exception ex) { error = ex.Message; return false; }
     }
 
+/// <summary>解析主配置更新参数：patch 接受 JSON 对象或 JSON 字符串；为兼容模型常见误用，settings_patch 也作为别名接受。</summary>
+    private static JsonElement ResolvePatchArgument(JsonElement arguments, out bool usedAlias)
+    {
+        usedAlias = false;
+        if (arguments.TryGetProperty("patch", out var patch)) return NormalizePatch(patch);
+        if (arguments.TryGetProperty("settings_patch", out var alias))
+        {
+            usedAlias = true;
+            return NormalizePatch(alias);
+        }
+        throw new ArgumentException("缺少 patch 参数。正确格式：{\"patch\":{\"字段名\":新值}}，例如 {\"patch\":{\"Scale\":1.2}}。");
+    }
+
+    private static JsonElement NormalizePatch(JsonElement raw)
+    {
+        if (raw.ValueKind == JsonValueKind.Object) return raw;
+        if (raw.ValueKind == JsonValueKind.String)
+        {
+            try
+            {
+                using var doc = JsonDocument.Parse(raw.GetString() ?? "");
+                if (doc.RootElement.ValueKind == JsonValueKind.Object) return doc.RootElement.Clone();
+            }
+            catch (JsonException)
+            {
+                // fall through to the shared error message
+            }
+            throw new ArgumentException("patch 字符串不是有效的 JSON 对象。正确格式：{\"patch\":{\"字段名\":新值}}，例如 {\"patch\":{\"Scale\":1.2}}。");
+        }
+        throw new ArgumentException("patch 必须是 JSON 对象，或可解析为 JSON 对象的 JSON 字符串。正确格式：{\"patch\":{\"字段名\":新值}}，例如 {\"patch\":{\"Scale\":1.2}}。");
+    }
+
     private static JsonObject UpdateMainConfig(JsonElement arguments)
     {
-        if (!arguments.TryGetProperty("patch", out var patch) || patch.ValueKind != JsonValueKind.Object) throw new ArgumentException("patch 必须是 JSON 对象。正确格式：{\"patch\":{\"字段名\":新值}}，例如 {\"patch\":{\"Scale\":1.2}}。");
+        var patch = ResolvePatchArgument(arguments, out var usedAlias);
+        if (patch.ValueKind != JsonValueKind.Object) throw new ArgumentException("patch 必须是 JSON 对象，或可解析为 JSON 对象的 JSON 字符串。正确格式：{\"patch\":{\"字段名\":新值}}，例如 {\"patch\":{\"Scale\":1.2}}。");
         if (!File.Exists(MainConfigPath)) throw new FileNotFoundException("ClassIsland 主配置不存在。", MainConfigPath);
         var settingsNode = (JsonNode.Parse(File.ReadAllText(MainConfigPath)) as JsonObject) ?? throw new InvalidDataException("主配置不是 JSON 对象。");
         foreach (var item in patch.EnumerateObject())
@@ -1480,7 +1513,7 @@ public sealed class HttpApiServer : IDisposable
         ValidateMainConfig(settingsNode);
         var appliedRuntime = TryApplyRuntimeSettings(settingsNode, patch);
         if (!appliedRuntime) WriteJsonAtomically(MainConfigPath, settingsNode);
-        return new JsonObject { ["written"] = true, ["applied_runtime"] = appliedRuntime, ["config_file"] = "Settings.json", ["updated_properties"] = new JsonArray(patch.EnumerateObject().Select(x => (JsonNode)x.Name).ToArray()) };
+        return new JsonObject { ["written"] = true, ["applied_runtime"] = appliedRuntime, ["config_file"] = "Settings.json", ["updated_properties"] = new JsonArray(patch.EnumerateObject().Select(x => (JsonNode)x.Name).ToArray()), ["patch_used_alias"] = usedAlias };
     }
 
     private static bool TryApplyRuntimeSettings(JsonObject settings, JsonElement patch)
