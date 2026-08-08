@@ -1,4 +1,4 @@
-using System.Net;
+﻿using System.Net;
 using System.Net.Http.Json;
 using System.Globalization;
 using System.Reflection;
@@ -40,7 +40,8 @@ public sealed class Plugin : PluginBase
 
 public sealed class SecAgentController
 {
-    public const string ServerUrl = "http://127.0.0.1:18789";
+    // SecAgent 测试：允许通过环境变量 CLASSISLAND_CONNECTOR_URL 覆盖服务端口，使测试实例与正式版可并存。
+    public static readonly string ServerUrl = Environment.GetEnvironmentVariable("CLASSISLAND_CONNECTOR_URL") ?? "http://127.0.0.1:18789";
     public const string SecAgentServerUrl = "http://127.0.0.1:42189";
     private const string ConnectorId = "classisland-connector";
     private static readonly HttpClient Client = new() { Timeout = TimeSpan.FromSeconds(8) };
@@ -85,7 +86,8 @@ public sealed record SecAgentRegistrationStatus(string ServerUrl, bool ServerRun
 
 public sealed class HttpApiServer : IDisposable
 {
-    public const string ServerUrl = "http://127.0.0.1:18789";
+    // SecAgent 测试：允许通过环境变量 CLASSISLAND_CONNECTOR_URL 覆盖服务端口，使测试实例与正式版可并存。
+    public static readonly string ServerUrl = Environment.GetEnvironmentVariable("CLASSISLAND_CONNECTOR_URL") ?? "http://127.0.0.1:18789";
     private readonly HttpListener _listener = new();
     private CancellationTokenSource? _cts;
     public bool IsRunning => _cts is not null;
@@ -367,12 +369,33 @@ public sealed class HttpApiServer : IDisposable
         };
     }
 
+    private static DateTime GetCurrentCiTime()
+    {
+        try
+        {
+            return IAppHost.GetService<IExactTimeService>().GetCurrentLocalDateTime();
+        }
+        catch
+        {
+            return DateTime.Now;
+        }
+    }
+
+    private static string? ResolveProfilePath(string? profilePath)
+    {
+        if (string.IsNullOrWhiteSpace(profilePath)) return null;
+        if (Path.IsPathRooted(profilePath)) return profilePath;
+        var candidate = Path.Combine(CommonDirectories.AppRootFolderPath, "Profiles", profilePath);
+        return File.Exists(candidate) ? candidate : profilePath;
+    }
+
     private static JsonObject VersionStatus() => new()
     {
         ["appVersion"] = AppBase.AppVersion, ["appVersionLong"] = AppBase.AppVersionLong,
         ["buildType"] = AppBase.Current.BuildType, ["appSubChannel"] = AppBase.Current.AppSubChannel,
         ["platform"] = AppBase.Current.Platform, ["operatingSystem"] = AppBase.Current.OperatingSystem,
-        ["localDateTime"] = DateTime.Now.ToString("O"), ["localDate"] = DateTime.Now.ToString("yyyy-MM-dd"),
+        // 返回 CI 内部时钟（可能被 SecAgent 模拟时间覆盖）
+        ["localDateTime"] = GetCurrentCiTime().ToString("O"), ["localDate"] = GetCurrentCiTime().ToString("yyyy-MM-dd"),
         ["isDevelopmentBuild"] = AppBase.Current.IsDevelopmentBuild
     };
 
@@ -400,12 +423,13 @@ public sealed class HttpApiServer : IDisposable
     {
         var dateText = OptionalString(arguments, "date");
         DateTime targetDate;
-        if (string.IsNullOrWhiteSpace(dateText)) targetDate = DateTime.Today;
+        // 优先使用 CI 内部时钟（支持 SecAgent 模拟时间），而非真实系统时间。
+        if (string.IsNullOrWhiteSpace(dateText)) targetDate = GetCurrentCiTime().Date;
         else if (!DateTime.TryParseExact(dateText, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out targetDate))
             throw new ArgumentException("date 必须是 YYYY-MM-DD 格式，例如 2026-08-03。");
 
         var profileService = IAppHost.Host?.Services.GetService<IProfileService>() ?? throw new InvalidOperationException("ClassIsland 当前没有可用的档案服务。");
-        var profilePath = profileService.CurrentProfilePath;
+        var profilePath = ResolveProfilePath(profileService.CurrentProfilePath);
         if (string.IsNullOrWhiteSpace(profilePath) || !File.Exists(profilePath)) throw new FileNotFoundException("ClassIsland 当前档案不存在。", profilePath);
         var profile = JsonNode.Parse(File.ReadAllText(profilePath)) as JsonObject ?? throw new InvalidDataException("ClassIsland 当前档案不是有效 JSON 对象。");
         var plans = profile["ClassPlans"] as JsonObject ?? new JsonObject();
@@ -430,7 +454,10 @@ public sealed class HttpApiServer : IDisposable
             ["date"] = targetDate.ToString("yyyy-MM-dd"),
             ["weekday"] = WeekdayName((int)targetDate.DayOfWeek),
             ["profile_name"] = Path.GetFileName(profilePath),
-            ["profile_display_name"] = NodeString(profile["Name"])
+            ["profile_display_name"] = NodeString(profile["Name"]),
+            // 下面两个字段返回 CI 内部当前时刻（支持模拟时间），方便模型判断“当前”对应哪个时间段。
+            ["now"] = GetCurrentCiTime().ToString("O"),
+            ["now_local"] = GetCurrentCiTime().ToString("yyyy-MM-dd HH:mm:ss")
         };
 
         if (selectedPlanId is null || plans[selectedPlanId] is not JsonObject plan)
@@ -618,7 +645,7 @@ public sealed class HttpApiServer : IDisposable
             days.Add(new TimetableDay(weekday, dayName!, rows));
         }
 
-        var templatePath = IAppHost.Host?.Services.GetService<IProfileService>()?.CurrentProfilePath;
+        var templatePath = ResolveProfilePath(IAppHost.Host?.Services.GetService<IProfileService>()?.CurrentProfilePath);
         if (string.IsNullOrWhiteSpace(templatePath) || !File.Exists(templatePath)) templatePath = Path.Combine(profilesPath, "Default.json");
         var root = File.Exists(templatePath)
             ? JsonNode.Parse(File.ReadAllText(templatePath)) as JsonObject ?? throw new InvalidDataException("当前 CI 档案不是有效 JSON 对象。")
