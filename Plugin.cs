@@ -115,6 +115,9 @@ public sealed class HttpApiServer : IDisposable
     private const string ReadComponentConfigTool = "read_classisland_component_config";
     private const string WriteComponentConfigTool = "write_classisland_component_config";
     private const string UpdateComponentTool = "update_classisland_component";
+    private const string SwapClassesTool = "swap_classisland_classes";
+    private const string ChangeClassTool = "change_classisland_class";
+    private const string ScheduleDayAsTool = "schedule_classisland_day_as";
     private async Task ListenAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -186,11 +189,14 @@ public sealed class HttpApiServer : IDisposable
         Tool(WriteProfileTool, "对 ClassIsland 档案执行差量更新。", ProfileWriteSchema()),
         Tool(ReadMainConfigTool, "读取 ClassIsland 主配置。", EmptySchema()),
         Tool(ListMainSettingsTool, "列出 ClassIsland 可持久化主设置的类型、当前值和枚举选项。", MainSettingsListSchema()),
-        Tool(UpdateMainConfigTool, "按属性更新 ClassIsland 主配置。", ObjectSchema(("patch", "object"))),
+        Tool(UpdateMainConfigTool, "按属性更新 ClassIsland 主配置。参数格式：{\"patch\":{\"字段名\":新值}}，例如 {\"patch\":{\"TimeOffsetSeconds\":-5}} 或 {\"patch\":{\"Scale\":1.2}}。", ObjectSchema(("patch", "object"))),
         Tool(ListComponentConfigsTool, "列出 ClassIsland 主界面组件配置。", EmptySchema()),
         Tool(ListComponentsTool, "列出 ClassIsland 主界面的组件、名称、类型和通用高级设置。", ComponentListSchema()),
         Tool(ReadComponentConfigTool, "读取 ClassIsland 主界面组件配置。", ComponentConfigReadSchema()),
         Tool(WriteComponentConfigTool, "修改 ClassIsland 主界面组件配置。", ComponentConfigWriteSchema()),
+        Tool(SwapClassesTool, "交换两节课的科目（支持跨天）。temporary=true 时写入临时层课表并标记临时换课，不影响原课表。", SwapClassesSchema(), hidden: false),
+        Tool(ChangeClassTool, "把某一天某一节课临时改成指定科目（占课）。temporary=true 时写入临时层课表。", ChangeClassSchema(), hidden: false),
+        Tool(ScheduleDayAsTool, "把指定日期设为使用另一天/另一星期几的课表（调休），通过预定课表生效。", ScheduleDayAsSchema(), hidden: false),
         Tool(UpdateComponentTool, "按组件 ID 修改 ClassIsland 组件的通用高级设置或专属设置。", ComponentUpdateSchema()));
 
     private static JsonObject Tool(string name, string description, JsonObject schema, bool hidden = true) => new()
@@ -218,6 +224,48 @@ public sealed class HttpApiServer : IDisposable
         ["type"] = "object",
         ["properties"] = new JsonObject { ["profile_name"] = new JsonObject { ["type"] = "string" }, ["path"] = new JsonObject { ["type"] = "string", ["description"] = "点号分隔路径，例如 ClassPlans 或 ClassPlans.字典键；空字符串返回完整 JSON。" } },
         ["required"] = new JsonArray("profile_name", "path"), ["additionalProperties"] = false
+    };
+
+    private static JsonObject SwapClassesSchema() => new()
+    {
+        ["type"] = "object",
+        ["additionalProperties"] = false,
+        ["required"] = new JsonArray("date_a", "class_a", "date_b", "class_b"),
+        ["properties"] = new JsonObject
+        {
+            ["date_a"] = new JsonObject { ["type"] = "string", ["description"] = "第一节所在日期，格式 YYYY-MM-DD" },
+            ["class_a"] = new JsonObject { ["type"] = "integer", ["description"] = "第一节次序号，1=第1节" },
+            ["date_b"] = new JsonObject { ["type"] = "string", ["description"] = "第二节所在日期，格式 YYYY-MM-DD" },
+            ["class_b"] = new JsonObject { ["type"] = "integer", ["description"] = "第二节次序号，1=第1节" },
+            ["temporary"] = new JsonObject { ["type"] = "boolean", ["description"] = "是否临时换课（写入临时层并标记，不影响原课表）。默认 true" }
+        }
+    };
+
+    private static JsonObject ChangeClassSchema() => new()
+    {
+        ["type"] = "object",
+        ["additionalProperties"] = false,
+        ["required"] = new JsonArray("date", "class", "subject_name"),
+        ["properties"] = new JsonObject
+        {
+            ["date"] = new JsonObject { ["type"] = "string", ["description"] = "日期，格式 YYYY-MM-DD" },
+            ["class"] = new JsonObject { ["type"] = "integer", ["description"] = "节次序号，1=第1节" },
+            ["subject_name"] = new JsonObject { ["type"] = "string", ["description"] = "科目名称，例如 物理、自习" },
+            ["temporary"] = new JsonObject { ["type"] = "boolean", ["description"] = "是否临时占课（写入临时层并标记）。默认 true" }
+        }
+    };
+
+    private static JsonObject ScheduleDayAsSchema() => new()
+    {
+        ["type"] = "object",
+        ["additionalProperties"] = false,
+        ["required"] = new JsonArray("date"),
+        ["properties"] = new JsonObject
+        {
+            ["date"] = new JsonObject { ["type"] = "string", ["description"] = "目标日期，格式 YYYY-MM-DD" },
+            ["source_date"] = new JsonObject { ["type"] = "string", ["description"] = "源日期，格式 YYYY-MM-DD；与 source_weekday 二选一" },
+            ["source_weekday"] = new JsonObject { ["type"] = "integer", ["description"] = "源星期几：0=周日，1=周一，…，6=周六；与 source_date 二选一" }
+        }
     };
 
     private static JsonObject ScheduleSchema() => new()
@@ -365,7 +413,203 @@ public sealed class HttpApiServer : IDisposable
             ReadComponentConfigTool => ReadComponentConfig(arguments),
             WriteComponentConfigTool => WriteComponentConfig(arguments),
             UpdateComponentTool => UpdateComponent(arguments),
+            SwapClassesTool => SwapClasses(arguments),
+            ChangeClassTool => ChangeClass(arguments),
+            ScheduleDayAsTool => ScheduleDayAs(arguments),
             _ => throw new ArgumentException($"未知工具：{name}")
+        };
+    }
+
+    private static (JsonObject Profile, string Path) LoadProfileRoot()
+    {
+        var profileService = IAppHost.Host?.Services.GetService<IProfileService>() ?? throw new InvalidOperationException("ClassIsland 当前没有可用的档案服务。");
+        var profilePath = ResolveProfilePath(profileService.CurrentProfilePath);
+        if (string.IsNullOrWhiteSpace(profilePath) || !File.Exists(profilePath)) throw new FileNotFoundException("ClassIsland 当前档案不存在。", profilePath);
+        var profile = JsonNode.Parse(File.ReadAllText(profilePath)) as JsonObject ?? throw new InvalidDataException("ClassIsland 当前档案不是有效 JSON 对象。");
+        return (profile, profilePath);
+    }
+
+    private static DateTime ParseDateArg(JsonElement element, string property)
+    {
+        var text = OptionalString(element, property);
+        if (!DateTime.TryParseExact(text, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var date))
+            throw new ArgumentException($"{property} 必须是 YYYY-MM-DD 格式，例如 2026-08-05。");
+        return date;
+    }
+
+    private static int? OptionalInt(JsonElement element, string property)
+    {
+        if (element.TryGetProperty(property, out var value) && int.TryParse(value.ToString(), out var parsed)) return parsed;
+        return null;
+    }
+
+    private static bool? OptionalBool(JsonElement element, string property)
+    {
+        if (element.TryGetProperty(property, out var value) && (value.ValueKind == JsonValueKind.True || value.ValueKind == JsonValueKind.False)) return value.GetBoolean();
+        return null;
+    }
+
+    /// <summary>按日期选出当天生效的课表 key：先查预定（OrderedSchedules），再按星期规则匹配。与 get_classisland_schedule 的选表逻辑一致。</summary>
+    private static string? FindSchedulePlanId(JsonObject profile, DateTime targetDate)
+    {
+        var plans = profile["ClassPlans"] as JsonObject ?? new JsonObject();
+        var scheduledPlanId = FindOrderedSchedulePlanId(profile, targetDate);
+        if (scheduledPlanId is not null && plans[scheduledPlanId] is JsonObject) return scheduledPlanId;
+        var weekday = (int)targetDate.DayOfWeek;
+        var candidates = plans
+            .Where(item => item.Value is JsonObject plan && IsPlanEnabled(plan) && IsPlanForWeekday(plan, weekday))
+            .ToList();
+        var selectedGroupId = NodeString(profile["SelectedClassPlanGroupId"]);
+        var groupMatch = candidates.FirstOrDefault(item => string.IsNullOrWhiteSpace(selectedGroupId) || string.Equals(NodeString((item.Value as JsonObject)?["AssociatedGroup"]), selectedGroupId, StringComparison.OrdinalIgnoreCase));
+        var selected = groupMatch.Value is not null ? groupMatch : candidates.FirstOrDefault();
+        return selected.Key;
+    }
+
+    private static string? FindPlanIdByWeekday(JsonObject profile, int weekday)
+    {
+        var plans = profile["ClassPlans"] as JsonObject ?? new JsonObject();
+        var match = plans.FirstOrDefault(item => item.Value is JsonObject plan && IsPlanEnabled(plan) && (NodeInt((plan["TimeRule"] as JsonObject)?["WeekDay"]) ?? NodeInt((plan["TimeRule"] as JsonObject)?["Weekday"])) == weekday);
+        return match.Key;
+    }
+
+    /// <summary>创建/复用指定日期的可写课表。temporary=true 时返回临时层课表（从基础课表复制并标记），不影响原课表。</summary>
+    private static JsonObject? GetTargetClassPlanJson(JsonObject profile, DateTime date, bool temporary, out Guid? targetGuid)
+    {
+        targetGuid = null;
+        var basePlanId = FindSchedulePlanId(profile, date);
+        if (basePlanId is null || !Guid.TryParse(basePlanId, out var baseGuid) || profile["ClassPlans"]?[basePlanId] is not JsonObject basePlan) return null;
+        if (!temporary || (NodeBool(basePlan["IsOverlay"]) ?? false))
+        {
+            targetGuid = baseGuid;
+            return basePlan;
+        }
+        var orderedId = FindOrderedSchedulePlanId(profile, date);
+        if (orderedId is not null && profile["ClassPlans"]?[orderedId] is JsonObject overlayPlan && (NodeBool(overlayPlan["IsOverlay"]) ?? false))
+        {
+            targetGuid = baseGuid;
+            return basePlan;
+        }
+        var newId = CreateTempClassPlanJson(profile, baseGuid, date);
+        targetGuid = baseGuid;
+        if (newId is null) return null;
+        return profile["ClassPlans"]?[newId.Value.ToString()] as JsonObject;
+    }
+
+    /// <summary>复制基础课表为临时层：IsOverlay=true、OverlaySourceId、OverlaySetupTime、追加名称，并写入当天 OrderedSchedules。</summary>
+    private static Guid? CreateTempClassPlanJson(JsonObject profile, Guid sourceId, DateTime date)
+    {
+        if (profile["ClassPlans"] is not JsonObject classPlans || classPlans[sourceId.ToString()] is not JsonObject source) return null;
+        var existingOrdered = FindOrderedSchedulePlanId(profile, date);
+        if (existingOrdered is not null && classPlans[existingOrdered] is JsonObject ep && (NodeBool(ep["IsOverlay"]) ?? false)) return null;
+        var copy = (JsonObject)source.DeepClone();
+        var newId = Guid.NewGuid();
+        copy["IsOverlay"] = true;
+        copy["OverlaySourceId"] = sourceId;
+        copy["OverlaySetupTime"] = date;
+        copy["Name"] = $"{NodeString(copy["Name"])}（临时层）";
+        classPlans[newId.ToString()] = copy;
+        var ordered = profile["OrderedSchedules"] as JsonObject ?? (JsonObject)(profile["OrderedSchedules"] = new JsonObject());
+        ordered[date.ToString("yyyy-MM-dd'T'00:00:00")] = new JsonObject { ["ClassPlanId"] = newId.ToString(), ["IsActive"] = false };
+        profile["IsOverlayClassPlanEnabled"] = true;
+        profile["OverlayClassPlanId"] = newId;
+        return newId;
+    }
+
+    private static string SubjectName(JsonObject profile, JsonObject classInfo)
+    {
+        var id = NodeString(classInfo["SubjectId"]);
+        return NodeString((profile["Subjects"] as JsonObject)?[id]?["Name"]);
+    }
+
+    private static JsonObject SwapClasses(JsonElement arguments)
+    {
+        var dateA = ParseDateArg(arguments, "date_a");
+        var dateB = ParseDateArg(arguments, "date_b");
+        var classA = OptionalInt(arguments, "class_a") ?? throw new ArgumentException("class_a 必须是节次序号（1=第1节）。");
+        var classB = OptionalInt(arguments, "class_b") ?? throw new ArgumentException("class_b 必须是节次序号（1=第1节）。");
+        var temporary = OptionalBool(arguments, "temporary") ?? true;
+        var (profile, path) = LoadProfileRoot();
+        var planA = GetTargetClassPlanJson(profile, dateA, temporary, out _);
+        var planB = GetTargetClassPlanJson(profile, dateB, temporary, out _);
+        if (planA is null || planB is null) throw new ArgumentException($"找不到 {dateA:yyyy-MM-dd} 或 {dateB:yyyy-MM-dd} 的课表。");
+        var classesA = planA["Classes"] as JsonArray;
+        var classesB = planB["Classes"] as JsonArray;
+        if (classesA is null || classesB is null || classesA.Count < classA || classesB.Count < classB)
+            throw new ArgumentException($"节次超出范围：{dateA:yyyy-MM-dd} 有 {classesA?.Count ?? 0} 节，{dateB:yyyy-MM-dd} 有 {classesB?.Count ?? 0} 节。");
+        var infoA = classesA[classA - 1] as JsonObject ?? throw new ArgumentException($"第 {classA} 节不是有效课程项。");
+        var infoB = classesB[classB - 1] as JsonObject ?? throw new ArgumentException($"第 {classB} 节不是有效课程项。");
+        var subjectA = infoA["SubjectId"]?.DeepClone();
+        var subjectB = infoB["SubjectId"]?.DeepClone();
+        infoA["SubjectId"] = subjectB;
+        infoB["SubjectId"] = subjectA;
+        if (temporary) { infoA["IsChangedClass"] = true; infoB["IsChangedClass"] = true; }
+        WriteJsonAtomically(path, profile);
+        return new JsonObject
+        {
+            ["ok"] = true,
+            ["temporary"] = temporary,
+            ["swapped"] = new JsonObject
+            {
+                [$"{dateA:yyyy-MM-dd} 第{classA}节"] = SubjectName(profile, infoA),
+                [$"{dateB:yyyy-MM-dd} 第{classB}节"] = SubjectName(profile, infoB)
+            },
+            ["message"] = $"已交换 {dateA:yyyy-MM-dd} 第{classA}节 与 {dateB:yyyy-MM-dd} 第{classB}节。"
+        };
+    }
+
+    private static JsonObject ChangeClass(JsonElement arguments)
+    {
+        var date = ParseDateArg(arguments, "date");
+        var classIndex = OptionalInt(arguments, "class") ?? throw new ArgumentException("class 必须是节次序号（1=第1节）。");
+        var subjectName = OptionalString(arguments, "subject_name");
+        if (string.IsNullOrWhiteSpace(subjectName)) throw new ArgumentException("subject_name 不能为空。");
+        var temporary = OptionalBool(arguments, "temporary") ?? true;
+        var (profile, path) = LoadProfileRoot();
+        var subjects = profile["Subjects"] as JsonObject ?? (JsonObject)(profile["Subjects"] = new JsonObject());
+        var subjectId = FindOrCreateSubject(subjects, subjectName, new JsonArray());
+        var targetPlan = GetTargetClassPlanJson(profile, date, temporary, out _);
+        if (targetPlan is null) throw new ArgumentException($"找不到 {date:yyyy-MM-dd} 的课表。");
+        var classes = targetPlan["Classes"] as JsonArray;
+        if (classes is null) throw new ArgumentException($"节次超出范围：{date:yyyy-MM-dd} 没有课程列表。");
+        if (classes.Count < classIndex) throw new ArgumentException($"节次超出范围：{date:yyyy-MM-dd} 只有 {classes.Count} 节。");
+        var classInfo = classes[classIndex - 1] as JsonObject ?? throw new ArgumentException($"第 {classIndex} 节不是有效课程项。");
+        classInfo["SubjectId"] = subjectId;
+        if (temporary) classInfo["IsChangedClass"] = true;
+        WriteJsonAtomically(path, profile);
+        return new JsonObject { ["ok"] = true, ["date"] = date.ToString("yyyy-MM-dd"), ["class"] = classIndex, ["subject"] = subjectName, ["temporary"] = temporary };
+    }
+
+    private static JsonObject ScheduleDayAs(JsonElement arguments)
+    {
+        var date = ParseDateArg(arguments, "date");
+        var sourceDateText = OptionalString(arguments, "source_date");
+        var sourceWeekday = OptionalInt(arguments, "source_weekday");
+        var (profile, path) = LoadProfileRoot();
+        string? sourcePlanId;
+        if (!string.IsNullOrWhiteSpace(sourceDateText))
+        {
+            if (!DateTime.TryParseExact(sourceDateText, "yyyy-MM-dd", CultureInfo.InvariantCulture, DateTimeStyles.None, out var sourceDate))
+                throw new ArgumentException("source_date 必须是 YYYY-MM-DD 格式。");
+            sourcePlanId = FindSchedulePlanId(profile, sourceDate);
+            if (sourcePlanId is null) throw new ArgumentException($"找不到 {sourceDateText} 使用的课表。");
+        }
+        else if (sourceWeekday is { } wd)
+        {
+            if (wd < 0 || wd > 6) throw new ArgumentException("source_weekday 必须是 0（周日）到 6（周六）。");
+            sourcePlanId = FindPlanIdByWeekday(profile, wd);
+            if (sourcePlanId is null) throw new ArgumentException($"没有星期 {WeekdayName(wd)} 的课表。");
+        }
+        else throw new ArgumentException("必须提供 source_date 或 source_weekday 之一。");
+        var ordered = profile["OrderedSchedules"] as JsonObject ?? (JsonObject)(profile["OrderedSchedules"] = new JsonObject());
+        ordered[date.ToString("yyyy-MM-dd'T'00:00:00")] = new JsonObject { ["ClassPlanId"] = sourcePlanId, ["IsActive"] = false };
+        WriteJsonAtomically(path, profile);
+        return new JsonObject
+        {
+            ["ok"] = true,
+            ["date"] = date.ToString("yyyy-MM-dd"),
+            ["class_plan_id"] = sourcePlanId,
+            ["class_plan_name"] = NodeString((profile["ClassPlans"] as JsonObject)?[sourcePlanId]?["Name"]),
+            ["message"] = $"已把 {date:yyyy-MM-dd}（{WeekdayName((int)date.DayOfWeek)}）的课表设为使用源课表。"
         };
     }
 
@@ -1224,7 +1468,7 @@ public sealed class HttpApiServer : IDisposable
 
     private static JsonObject UpdateMainConfig(JsonElement arguments)
     {
-        if (!arguments.TryGetProperty("patch", out var patch) || patch.ValueKind != JsonValueKind.Object) throw new ArgumentException("patch 必须是 JSON 对象。");
+        if (!arguments.TryGetProperty("patch", out var patch) || patch.ValueKind != JsonValueKind.Object) throw new ArgumentException("patch 必须是 JSON 对象。正确格式：{\"patch\":{\"字段名\":新值}}，例如 {\"patch\":{\"Scale\":1.2}}。");
         if (!File.Exists(MainConfigPath)) throw new FileNotFoundException("ClassIsland 主配置不存在。", MainConfigPath);
         var settingsNode = (JsonNode.Parse(File.ReadAllText(MainConfigPath)) as JsonObject) ?? throw new InvalidDataException("主配置不是 JSON 对象。");
         foreach (var item in patch.EnumerateObject())
