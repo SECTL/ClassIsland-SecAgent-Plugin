@@ -4,7 +4,7 @@ using ClassIsland.Shared;
 
 namespace ClassIsland.SecAgent.Plugin;
 
-[SettingsPageInfo("classisland.secagent.settings", "SecAgent 联动插件")]
+[SettingsPageInfo("classisland.secagent.settings", "SecAgent 联动")]
 public partial class SecAgentSettingsPage : SettingsPageBase
 {
     private SecAgentController Controller => IAppHost.GetService<SecAgentController>();
@@ -20,7 +20,7 @@ public partial class SecAgentSettingsPage : SettingsPageBase
         try
         {
             Controller.Start();
-            MessageText.Text = "HTTP 服务已启动，SecAgent 联动插件会自动从插件市场安装。";
+            MessageText.Text = "HTTP 服务已启动，SecAgent 联动会自动从插件市场安装。";
             _ = Controller.EnsureConnectorInstalledAsync();
         }
         catch (Exception ex)
