@@ -4,8 +4,8 @@
       xmlns:ci="http://classisland.tech/schemas/xaml/core">
     <ScrollViewer>
         <StackPanel Margin="32" Spacing="16" MaxWidth="900">
-            <TextBlock Text="SecAgent 联动插件" FontSize="28" FontWeight="Bold" />
-            <TextBlock Text="ClassIsland 提供普通 HTTP JSON API，并在 SecAgent 可用时自动请求安装 SecAgent 端联动插件。"
+            <TextBlock Text="SecAgent 联动" FontSize="28" FontWeight="Bold" />
+            <TextBlock Text="ClassIsland 提供普通 HTTP JSON API，并在 SecAgent 可用时自动请求安装 SecAgent 端联动。"
                        TextWrapping="Wrap" Opacity="0.72" />
             <Separator />
             <TextBlock Text="联动状态" FontSize="18" FontWeight="SemiBold" />

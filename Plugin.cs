@@ -65,7 +65,7 @@ public sealed class SecAgentController
                     using var response = await Client.PostAsJsonAsync(SecAgentServerUrl + "/plugins/install", new { pluginId = ConnectorId });
                     var payload = await response.Content.ReadFromJsonAsync<JsonObject>() ?? new JsonObject();
                     if (!response.IsSuccessStatusCode) throw new InvalidOperationException(payload["error"]?["message"]?.GetValue<string>() ?? ("HTTP " + (int)response.StatusCode));
-                    _connectorStatus = ("已自动安装 SecAgent 联动插件 " + (payload["version"]?.GetValue<string>() ?? "")).Trim();
+                    _connectorStatus = ("已自动安装 SecAgent 联动 " + (payload["version"]?.GetValue<string>() ?? "")).Trim();
                     return;
                 }
                 catch (Exception ex)
