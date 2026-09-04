@@ -118,6 +118,10 @@ public sealed class HttpApiServer : IDisposable
     private const string SwapClassesTool = "swap_classisland_classes";
     private const string ChangeClassTool = "change_classisland_class";
     private const string ScheduleDayAsTool = "schedule_classisland_day_as";
+    private const string CallIslandCallerTool = "call_island_caller";
+    private const string ListIslandCallerProfilesTool = "list_island_caller_profiles";
+    private const string ReadIslandCallerRosterTool = "read_island_caller_roster";
+    private const string WriteIslandCallerRosterTool = "write_island_caller_roster";
     private async Task ListenAsync(CancellationToken cancellationToken)
     {
         while (!cancellationToken.IsCancellationRequested)
@@ -197,7 +201,11 @@ public sealed class HttpApiServer : IDisposable
         Tool(SwapClassesTool, "交换两节课的科目（支持跨天）。temporary=true 时写入临时层课表并标记临时换课，不影响原课表。", SwapClassesSchema(), hidden: false),
         Tool(ChangeClassTool, "把某一天某一节课临时改成指定科目（占课）。temporary=true 时写入临时层课表。", ChangeClassSchema(), hidden: false),
         Tool(ScheduleDayAsTool, "把指定日期设为使用另一天/另一星期几的课表（调休），通过预定课表生效。", ScheduleDayAsSchema(), hidden: false),
-        Tool(UpdateComponentTool, "按组件 ID 修改 ClassIsland 组件的通用高级设置或专属设置。", ComponentUpdateSchema()));
+        Tool(UpdateComponentTool, "按组件 ID 修改 ClassIsland 组件的通用高级设置或专属设置。", ComponentUpdateSchema()),
+        Tool(CallIslandCallerTool, "在 IslandCaller 中触发随机点名（需要已安装 IslandCaller 插件）：通过 ClassIsland 进程内反射调用 IslandCaller 的随机点名，默认抽 1 人，可指定人数和名单，返回本次被点到的学生。IslandCaller 未安装或未就绪时返回说明而不会出错。", CallIslandCallerSchema(), hidden: false),
+        Tool(ListIslandCallerProfilesTool, "列出 IslandCaller 已配置的名单（名称、GUID、是否为默认/当前名单、成员数）。", EmptySchema()),
+        Tool(ReadIslandCallerRosterTool, "读取 IslandCaller 名单的原始 CSV 与结构化成员列表。", IslandCallerRosterReadSchema()),
+        Tool(WriteIslandCallerRosterTool, "覆盖写入 IslandCaller 名单 CSV（成员数组），若该名单正是当前名单会自动重载使其立即生效。", IslandCallerRosterWriteSchema()));
 
     private static JsonObject Tool(string name, string description, JsonObject schema, bool hidden = true) => new()
     {
@@ -395,6 +403,53 @@ public sealed class HttpApiServer : IDisposable
         ["additionalProperties"] = false
     };
 
+    private static JsonObject CallIslandCallerSchema() => new()
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["count"] = new JsonObject { ["type"] = "integer", ["minimum"] = 1, ["maximum"] = 20, ["description"] = "本次随机点名的学生人数，默认 1。" },
+            ["profile_id"] = new JsonObject { ["type"] = "string", ["description"] = "可选：IslandCaller 名单的 GUID（来自 list_island_caller_profiles）；省略时使用 IslandCaller 当前名单。" }
+        },
+        ["additionalProperties"] = false
+    };
+
+    private static JsonObject IslandCallerRosterReadSchema() => new()
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["profile_id"] = new JsonObject { ["type"] = "string", ["description"] = "IslandCaller 名单的 GUID（来自 list_island_caller_profiles）。" }
+        },
+        ["required"] = new JsonArray("profile_id"), ["additionalProperties"] = false
+    };
+
+    private static JsonObject IslandCallerRosterWriteSchema() => new()
+    {
+        ["type"] = "object",
+        ["properties"] = new JsonObject
+        {
+            ["profile_id"] = new JsonObject { ["type"] = "string", ["description"] = "IslandCaller 名单的 GUID（来自 list_island_caller_profiles）。" },
+            ["members"] = new JsonObject
+            {
+                ["type"] = "array",
+                ["items"] = new JsonObject
+                {
+                    ["type"] = "object",
+                    ["properties"] = new JsonObject
+                    {
+                        ["name"] = new JsonObject { ["type"] = "string", ["description"] = "学生姓名。" },
+                        ["gender"] = new JsonObject { ["type"] = "integer", ["description"] = "可选：0=男、1=女，默认 0。" },
+                        ["manual_weight"] = new JsonObject { ["type"] = "number", ["description"] = "可选：教师设置的基准权重，默认 1.0。" }
+                    },
+                    ["required"] = new JsonArray("name"),
+                    ["additionalProperties"] = false
+                }
+            }
+        },
+        ["required"] = new JsonArray("profile_id", "members"), ["additionalProperties"] = false
+    };
+
     private static JsonNode CallTool(string name, JsonElement arguments)
     {
         return name switch
@@ -416,6 +471,10 @@ public sealed class HttpApiServer : IDisposable
             SwapClassesTool => SwapClasses(arguments),
             ChangeClassTool => ChangeClass(arguments),
             ScheduleDayAsTool => ScheduleDayAs(arguments),
+            CallIslandCallerTool => IslandCallerTools.CallIslandCaller(arguments),
+            ListIslandCallerProfilesTool => IslandCallerTools.ListIslandCallerProfiles(),
+            ReadIslandCallerRosterTool => IslandCallerTools.ReadIslandCallerRoster(arguments),
+            WriteIslandCallerRosterTool => IslandCallerTools.WriteIslandCallerRoster(arguments),
             _ => throw new ArgumentException($"未知工具：{name}")
         };
     }

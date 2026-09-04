@@ -3,7 +3,7 @@ name: SecAgent 联动
 description: 让 SecAgent 帮你操作 ClassIsland 配置档案、换课、调整设置...
 entranceAssembly: "ClassIsland.SecAgent.Plugin.dll"
 url: https://github.com/SECTL/ClassIsland-SecAgent-Plugin
-version: 0.1.0.1
+version: 0.1.1.0
 apiVersion: 2.0.0.0
 author: SECTL
 repoOwner: SECTL
