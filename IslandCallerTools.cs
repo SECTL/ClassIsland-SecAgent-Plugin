@@ -211,22 +211,26 @@ internal static class IslandCallerTools
                     return FailureResult($"切换到 IslandCaller 名单 {profileName}（{targetId}）失败：{ensureError}");
             }
 
-            // 4. 记录点名前的历史头部，调用后取差集得到本次被点学生
+            // 4. 记录点名前后的历史，通过“头部新增条数”对齐确定本次被点学生。
+            // 每次成功抽取 IslandCaller 都会 HistoryService.Add → top20List.Insert(0, name)，
+            // 即新点到的学生总是以新记录出现在历史头部；历史最多保留 20 条（超出时从尾部淘汰）。
+            // 因此不能用 before/after 的 Count 差值判断抽了几人（历史打满 20 条后 Count 不再变化）。
             var top20Field = historyService.GetType().GetField("top20List", BindingFlags.Instance | BindingFlags.NonPublic);
             if (top20Field is null) throw new InvalidOperationException("当前 IslandCaller 版本不兼容：无法读取点名历史。");
-            var beforeList = top20Field.GetValue(historyService) as System.Collections.IList;
-            var beforeCount = beforeList?.Count ?? 0;
+            // 先复制点名前的历史（top20List 始终是同一个 List 对象，Add 就地修改，不能保存“引用快照”）。
+            var beforeList = SnapshotList(top20Field.GetValue(historyService) as System.Collections.IList);
 
             var showMethod = callerService.GetType().GetMethod("ShowRandomStudent", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
             if (showMethod is null) throw new InvalidOperationException("当前 IslandCaller 版本不兼容：找不到随机点名入口。");
 
             RunOnUiThread(() => showMethod.Invoke(callerService, new object[] { count }));
 
-            var afterList = top20Field.GetValue(historyService) as System.Collections.IList;
-            var added = Math.Max(0, (afterList?.Count ?? 0) - beforeCount);
+            var afterList = SnapshotList(top20Field.GetValue(historyService) as System.Collections.IList);
+            // 求出本次点名新增的历史头部条数：新记录逐条压在旧记录之前，去掉头部新增记录后，
+            // 剩余部分应仍与点名前的历史按原顺序对齐（历史超 20 条时从尾部淘汰，因此可能被截短）。
+            var newHeadCount = CountNewHeadEntries(beforeList, afterList, count);
             var drawnNames = new List<string>();
-            // IslandCaller 把新点名的人插入历史头部，取头部新增部分并反转为抽取顺序。
-            for (var i = 0; i < Math.Min(added, count) && afterList is not null && i < afterList.Count; i++)
+            for (var i = 0; i < newHeadCount && i < afterList.Count; i++)
             {
                 if (afterList[i] is string name) drawnNames.Add(name);
             }
@@ -600,5 +604,57 @@ internal static class IslandCallerTools
     {
         if (element.TryGetProperty(property, out var value) && value.ValueKind == JsonValueKind.String) return value.GetString();
         return null;
+    }
+
+    // ---------------- 历史头部新增条数判定 ----------------
+
+    /// <summary>把历史列表（IList）复制为独立快照，避免持有同一对象的引用而被后续就地修改污染。</summary>
+    private static List<object?> SnapshotList(System.Collections.IList? list)
+    {
+        var snapshot = new List<object?>();
+        if (list is null) return snapshot;
+        foreach (var item in list) snapshot.Add(item);
+        return snapshot;
+    }
+
+    /// <summary>
+    /// 计算本次点名在历史头部新增的条数。IslandCaller 每次成功抽取都会把学生插到
+    /// top20List 头部，因此点名后列表形如 [新增...][原历史...]；把 after 头部去掉 k 条后，
+    /// 剩余部分应能按原顺序与 before 对齐（原历史超 20 条时会被从尾部淘汰而截短）。
+    /// 从大到小尝试 k，取第一个完全对齐的值，即为实际被点到的人数。
+    /// </summary>
+    private static int CountNewHeadEntries(List<object?> before, List<object?> after, int requestedCount)
+    {
+        if (after.Count == 0 || requestedCount <= 0) return 0;
+        // 点名没有产生任何新增记录（例如调用时插件刚好未就绪而提前返回）。
+        if (SequencesEqual(before, after)) return 0;
+        var maxK = Math.Min(requestedCount, after.Count);
+        for (var k = maxK; k >= 0; k--)
+        {
+            var tailLength = after.Count - k;
+            // 尾部（去新增后剩下的原历史）不能比点名前的历史更长。
+            if (tailLength > before.Count) continue;
+            var aligned = true;
+            for (var i = 0; i < tailLength; i++)
+            {
+                if (!Equals(after[k + i], before[i]))
+                {
+                    aligned = false;
+                    break;
+                }
+            }
+            if (aligned) return k;
+        }
+        return 0;
+    }
+
+    private static bool SequencesEqual(List<object?> left, List<object?> right)
+    {
+        if (left.Count != right.Count) return false;
+        for (var i = 0; i < left.Count; i++)
+        {
+            if (!Equals(left[i], right[i])) return false;
+        }
+        return true;
     }
 }
